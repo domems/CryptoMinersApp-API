@@ -2,7 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import {sql} from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
-import minerRoutes from "./src/routes/miners.js";
+import minerRoutes from "./routes/miners.js";
 
 dotenv.config();
 

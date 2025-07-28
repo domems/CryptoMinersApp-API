@@ -6,9 +6,10 @@ export const getUserIdByEmail = async (req, res) => {
   const { email } = req.params;
 
   try {
-    const response = await fetch(`https://api.clerk.com/v1/users?email_address=${email}`, {
+    const response = await fetch(`https://api.clerk.dev/v1/users?email_address=${email}`, {
       headers: {
         Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}`,
+        "Content-Type": "application/json",
       },
     });
 

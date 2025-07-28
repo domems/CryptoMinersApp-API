@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import {sql} from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
+import clerkRoutes from "./routes/clerkRoutes.js";
 
 dotenv.config();
 
@@ -13,7 +14,7 @@ const app = express();
 //middleware
 app.use(rateLimiter);
 app.use(express.json());
-
+app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
 
 async function initDB() {

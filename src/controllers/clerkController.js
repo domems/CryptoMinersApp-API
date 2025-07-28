@@ -8,7 +8,7 @@ export const getUserIdByEmail = async (req, res) => {
   try {
     const response = await fetch(`https://api.clerk.accounts.dev/v1/users?email_address=${email}`, {
       headers: {
-        Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}`,
+        Authorization: `Bearer ${process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY}`,
         "Content-Type": "application/json",
       },
     });

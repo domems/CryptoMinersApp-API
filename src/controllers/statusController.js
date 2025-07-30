@@ -16,18 +16,23 @@ export const obterStatusViaWatcher = async (req, res) => {
 
     const response = await fetch(url);
     const html = await response.text();
-
     const $ = cheerio.load(html);
+
     let status = null;
 
-    $("table tbody tr").each((_, el) => {
-      const nome = $(el).find("td").eq(0).text().trim().toLowerCase();
-      const estado = $(el).find("td").eq(6).text().trim();
+    // Percorre todas as linhas da tabela
+    $("tbody tr").each((index, el) => {
+      const columns = $(el).find("td");
 
-      console.log("🔍 Encontrado na tabela:", nome, "| Status:", estado);
+      if (columns.length >= 7) {
+        const nome = columns.eq(0).text().trim().toLowerCase();
+        const estado = columns.eq(6).text().trim();
 
-      if (nome === workerName.trim().toLowerCase()) {
-        status = estado;
+        console.log(`🔍 Linha ${index}: nome='${nome}', estado='${estado}'`);
+
+        if (nome === workerName.trim().toLowerCase()) {
+          status = estado;
+        }
       }
     });
 

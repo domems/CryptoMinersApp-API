@@ -1,8 +1,8 @@
 import express from "express";
-import { obterStatusViaWatcher } from "../controllers/statusController.js";
+import { obterStatusViaBTC } from "../controllers/statusController.js";
 
 const router = express.Router();
 
-router.get("/:key/:worker", obterStatusViaWatcher);
+router.post("/status", obterStatusViaBTC);
 
 export default router;

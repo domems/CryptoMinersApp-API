@@ -1,40 +1,50 @@
+import crypto from "crypto";
 import axios from "axios";
-import * as cheerio from "cheerio";
 
-export const obterStatusViaWatcher = async (req, res) => {
-  const { key, worker } = req.params;
+// Gera a assinatura HMAC-SHA256 exigida pela API da ViaBTC
+function gerarAssinatura(secretKey, params) {
+  const sortedKeys = Object.keys(params).sort();
+  const paramString = sortedKeys.map((k) => `${k}=${params[k]}`).join("&");
+  return crypto.createHmac("sha256", secretKey).update(paramString).digest("hex");
+}
 
-  const url = `https://www.viabtc.com/observer/worker?access_key=${key}&coin=LTC`;
+export const obterStatusViaBTC = async (req, res) => {
+  const { api_key, secret_key, coin, worker_name } = req.body;
 
-  console.log("🔗 URL ScrapingBee:", url);
-  console.log("👷 Worker:", worker);
+  if (!api_key || !secret_key || !coin || !worker_name) {
+    return res.status(400).json({ error: "Dados incompletos." });
+  }
 
   try {
-    const { data: html } = await axios.get("https://app.scrapingbee.com/api/v1", {
-      params: {
-        api_key: "V4GIFU06ENY2J36VNGQB7JLTIA8MBR9JIJ69GTJDWLH1JWGKQ5ZC4X5DVN7I5O8XG86Z7HBVPQWNK95X", // substitui pela tua
-        url,
-        render_js: false,
+    const tonce = Date.now();
+
+    const params = {
+      access_key: api_key,
+      coin: coin.toLowerCase(),
+      worker: worker_name,
+      tonce,
+    };
+
+    const signature = gerarAssinatura(secret_key, params);
+
+    const config = {
+      headers: {
+        "Content-Type": "application/json",
       },
-    });
+    };
 
-    const $ = cheerio.load(html);
+    const body = {
+      ...params,
+      signature,
+    };
 
-    let status = "Desconhecido";
+    const { data } = await axios.post("https://www.viabtc.com/api/v1/private/worker/status", body, config);
 
-    $("table tr").each((i, el) => {
-      const nome = $(el).find("td").eq(0).text().trim();
-      const estado = $(el).find("td").eq(6).text().trim();
+    const status = data?.data?.status || "Desconhecido";
 
-      if (nome === worker) {
-        status = estado;
-      }
-    });
-
-    console.log("✅ Status encontrado:", status);
     res.json({ status });
   } catch (err) {
-    console.error("❌ Erro ao fazer scraping:", err.message);
-    res.status(500).json({ error: "Erro ao verificar status" });
+    console.error("❌ Erro ao consultar API ViaBTC:", err?.response?.data || err.message);
+    res.status(500).json({ error: "Erro ao obter status da mineradora." });
   }
 };

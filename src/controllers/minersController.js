@@ -7,14 +7,27 @@ const adminEmails = [
 ];
 
 export const criarMiner = async (req, res) => {
-  const { user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora } = req.body;
+  const {
+    user_id,
+    nome,
+    modelo,
+    hash_rate,
+    preco_kw,
+    consumo_kw_hora,
+    worker_name,
+    api_key,
+    secret_key,
+    coin
+  } = req.body;
 
   try {
     const [novoMiner] = await sql`
       INSERT INTO miners (
-        user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status
+        user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
+        worker_name, api_key, secret_key, coin
       ) VALUES (
-        ${user_id}, ${nome}, ${modelo}, ${hash_rate}, ${preco_kw}, ${consumo_kw_hora}, 'offline'
+        ${user_id}, ${nome}, ${modelo}, ${hash_rate}, ${preco_kw}, ${consumo_kw_hora}, 'offline',
+        ${worker_name}, ${api_key}, ${secret_key}, ${coin}
       )
       RETURNING *;
     `;
@@ -59,7 +72,7 @@ export const atualizarStatusMiner = async (req, res) => {
   }
 };
 
-// Atualização feita por admin (todos os campos)
+// Atualização feita por admin (todos os campos exceto credenciais/API)
 export const atualizarMinerComoAdmin = async (req, res) => {
   const { id } = req.params;
   const userEmail = req.header("x-user-email");
@@ -94,16 +107,23 @@ export const atualizarMinerComoAdmin = async (req, res) => {
   }
 };
 
-// Atualização feita por cliente (apenas watcher_key e worker_name)
+// Atualização feita por cliente (worker_name, api_key, secret_key, coin)
 export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
-  const { worker_name, watcher_key } = req.body;
+  const {
+    worker_name,
+    api_key,
+    secret_key,
+    coin
+  } = req.body;
 
   try {
     const [updatedMiner] = await sql`
       UPDATE miners
       SET worker_name = ${worker_name},
-          watcher_key = ${watcher_key}
+          api_key = ${api_key},
+          secret_key = ${secret_key},
+          coin = ${coin}
       WHERE id = ${id}
       RETURNING *;
     `;

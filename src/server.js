@@ -4,7 +4,6 @@ import {sql} from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
-import { verificarTodosStatus } from "./utils/checkAllMinersStatus.js";
 
 dotenv.config();
 

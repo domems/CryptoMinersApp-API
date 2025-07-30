@@ -1,44 +1,40 @@
-import puppeteer from "puppeteer";
+import axios from "axios";
+import * as cheerio from "cheerio";
 
 export const obterStatusViaWatcher = async (req, res) => {
-  const { watcherKey, workerName } = req.params;
-  const coin = req.query.coin || "LTC";
+  const { key, worker } = req.params;
 
-  console.log("🌐 Iniciando Puppeteer...");
-  console.log("🔑 Watcher Key:", watcherKey);
-  console.log("👷 Worker Name:", workerName);
-  console.log("🪙 Coin:", coin);
+  const url = `https://www.viabtc.com/observer/worker?access_key=${key}&coin=LTC`;
 
-  const url = `https://www.viabtc.com/observer/worker?access_key=${watcherKey}&coin=${coin}`;
-  console.log("🔗 Acessando URL:", url);
+  console.log("🔗 URL ScrapingBee:", url);
+  console.log("👷 Worker:", worker);
 
-  const browser = await puppeteer.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: 'networkidle2' });
+  try {
+    const { data: html } = await axios.get("https://app.scrapingbee.com/api/v1", {
+      params: {
+        api_key: "AQUI_VAI_A_TUA_API_KEY", // substitui pela tua
+        url,
+        render_js: false,
+      },
+    });
 
-  const result = await page.evaluate(({ workerName }) => {
-    const rows = Array.from(document.querySelectorAll("table tbody tr"));
-    for (const row of rows) {
-      const tds = row.querySelectorAll("td");
-      const nome = tds[0]?.textContent?.trim().toLowerCase();
-      const estado = tds[6]?.textContent?.trim();
-      console.log("🧾 Encontrado:", nome, estado);
-      if (nome === workerName.trim().toLowerCase()) {
-        return estado;
+    const $ = cheerio.load(html);
+
+    let status = "Desconhecido";
+
+    $("table tr").each((i, el) => {
+      const nome = $(el).find("td").eq(0).text().trim();
+      const estado = $(el).find("td").eq(6).text().trim();
+
+      if (nome === worker) {
+        status = estado;
       }
-    }
-    return null;
-  }, { workerName });
+    });
 
-  await browser.close();
-
-  if (!result) {
-    console.warn("⚠️ Worker não encontrado.");
-    return res.status(404).json({ status: "Desconhecido" });
+    console.log("✅ Status encontrado:", status);
+    res.json({ status });
+  } catch (err) {
+    console.error("❌ Erro ao fazer scraping:", err.message);
+    res.status(500).json({ error: "Erro ao verificar status" });
   }
-
-  console.log("✅ Status encontrado:", result);
-  return res.json({ status: result });
 };

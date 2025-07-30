@@ -1,5 +1,5 @@
 import fetch from "node-fetch";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 
 export const obterStatusViaWatcher = async (req, res) => {
   const { watcherKey, workerName } = req.params;

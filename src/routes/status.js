@@ -3,6 +3,6 @@ import { obterStatusViaWatcher } from "../controllers/statusController.js";
 
 const router = express.Router();
 
-router.get("/:watcherKey/:workerName", obterStatusViaWatcher);
+router.get("/:key/:worker", obterStatusViaWatcher);
 
 export default router;

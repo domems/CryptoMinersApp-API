@@ -125,3 +125,18 @@ export const apagarMiner = async (req, res) => {
     res.status(500).json({ error: "Erro ao apagar miner" });
   }
 };
+
+// Obter miner por ID
+export const obterMinerPorId = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [miner] = await sql`SELECT * FROM miners WHERE id = ${id}`;
+    if (!miner) return res.status(404).json({ error: "Mineradora não encontrada" });
+
+    res.json(miner);
+  } catch (err) {
+    console.error("Erro ao buscar miner:", err);
+    res.status(500).json({ error: "Erro ao buscar mineradora" });
+  }
+};

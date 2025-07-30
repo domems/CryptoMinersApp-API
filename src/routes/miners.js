@@ -5,7 +5,8 @@ import {
   atualizarStatusMiner,
   atualizarMinerComoAdmin,
   atualizarMinerComoCliente,
-  apagarMiner
+  apagarMiner,
+  obterMinerPorId
 } from "../controllers/minersController.js";
 
 const router = express.Router();
@@ -21,5 +22,9 @@ router.put("/cliente/:id", atualizarMinerComoCliente);
 
 router.put("/:id/status", atualizarStatusMiner);
 router.delete("/:id", apagarMiner);
+
+//Obter o miner pelo ID
+router.get("/miners/:id", obterMinerPorId);
+
 
 export default router;

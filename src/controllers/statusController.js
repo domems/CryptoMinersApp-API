@@ -1,50 +1,44 @@
-import fetch from "node-fetch";
-import * as cheerio from "cheerio";
+import puppeteer from "puppeteer";
 
 export const obterStatusViaWatcher = async (req, res) => {
   const { watcherKey, workerName } = req.params;
   const coin = req.query.coin || "LTC";
 
-  console.log("🌐 Verificando status do worker...");
+  console.log("🌐 Iniciando Puppeteer...");
   console.log("🔑 Watcher Key:", watcherKey);
   console.log("👷 Worker Name:", workerName);
   console.log("🪙 Coin:", coin);
 
-  try {
-    const url = `https://www.viabtc.com/observer/worker?access_key=${watcherKey}&coin=${coin}`;
-    console.log("🔗 URL ViaBTC:", url);
+  const url = `https://www.viabtc.com/observer/worker?access_key=${watcherKey}&coin=${coin}`;
+  console.log("🔗 Acessando URL:", url);
 
-    const response = await fetch(url);
-    const html = await response.text();
-    const $ = cheerio.load(html);
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: 'networkidle2' });
 
-    let status = null;
-
-    // Percorre todas as linhas da tabela
-    $("tbody tr").each((index, el) => {
-      const columns = $(el).find("td");
-
-      if (columns.length >= 7) {
-        const nome = columns.eq(0).text().trim().toLowerCase();
-        const estado = columns.eq(6).text().trim();
-
-        console.log(`🔍 Linha ${index}: nome='${nome}', estado='${estado}'`);
-
-        if (nome === workerName.trim().toLowerCase()) {
-          status = estado;
-        }
+  const result = await page.evaluate(({ workerName }) => {
+    const rows = Array.from(document.querySelectorAll("table tbody tr"));
+    for (const row of rows) {
+      const tds = row.querySelectorAll("td");
+      const nome = tds[0]?.textContent?.trim().toLowerCase();
+      const estado = tds[6]?.textContent?.trim();
+      console.log("🧾 Encontrado:", nome, estado);
+      if (nome === workerName.trim().toLowerCase()) {
+        return estado;
       }
-    });
-
-    if (!status) {
-      console.warn("⚠️ Worker não encontrado.");
-      return res.status(404).json({ status: "Desconhecido" });
     }
+    return null;
+  }, { workerName });
 
-    console.log("✅ Status encontrado:", status);
-    return res.json({ status });
-  } catch (err) {
-    console.error("❌ Erro ao verificar status:", err);
-    res.status(500).json({ error: "Erro ao obter status do worker." });
+  await browser.close();
+
+  if (!result) {
+    console.warn("⚠️ Worker não encontrado.");
+    return res.status(404).json({ status: "Desconhecido" });
   }
+
+  console.log("✅ Status encontrado:", result);
+  return res.json({ status: result });
 };

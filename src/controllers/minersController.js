@@ -32,7 +32,7 @@ export const listarMinersPorUser = async (req, res) => {
     const miners = await sql`
       SELECT * FROM miners
       WHERE user_id = ${userId}
-      ORDER BY data_registo DESC;
+      ORDER BY created_at DESC;
     `;
     res.json(miners);
   } catch (err) {

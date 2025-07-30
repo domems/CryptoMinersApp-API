@@ -4,12 +4,22 @@ import {sql} from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
+import { verificarTodosStatus } from "./utils/checkAllMinersStatus.js";
 
 dotenv.config();
+
+
+
 
 const PORT = process.env.PORT || 5001;
 
 const app = express();
+
+// Verifica estado de todas as mineradoras ao arrancar
+verificarTodosStatus();
+
+// Verifica a cada 15 minutos (15 * 60 * 1000 milissegundos)
+setInterval(verificarTodosStatus, 15 * 60 * 1000);
 
 //middleware
 app.use(rateLimiter);

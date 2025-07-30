@@ -12,7 +12,7 @@ export const obterStatusViaWatcher = async (req, res) => {
   try {
     const { data: html } = await axios.get("https://app.scrapingbee.com/api/v1", {
       params: {
-        api_key: "AQUI_VAI_A_TUA_API_KEY", // substitui pela tua
+        api_key: "V4GIFU06ENY2J36VNGQB7JLTIA8MBR9JIJ69GTJDWLH1JWGKQ5ZC4X5DVN7I5O8XG86Z7HBVPQWNK95X", // substitui pela tua
         url,
         render_js: false,
       },

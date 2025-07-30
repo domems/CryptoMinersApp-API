@@ -11,20 +11,19 @@ import {
 
 const router = express.Router();
 
-router.post("/", criarMiner);
-router.get("/:userId", listarMinersPorUser);
-
-// PUT /miners/admin/:id → usado pelo admin (edita tudo)
+// Rota mais específica vem primeiro
+router.get("/miners/:id", obterMinerPorId); // <-- esta deve vir antes da rota :userId
 router.put("/admin/:id", atualizarMinerComoAdmin);
-
-// PUT /miners/cliente/:id → usado pelo cliente (edita apenas watcher_key e worker_name)
 router.put("/cliente/:id", atualizarMinerComoCliente);
-
 router.put("/:id/status", atualizarStatusMiner);
 router.delete("/:id", apagarMiner);
 
-//Obter o miner pelo ID
-router.get("/miners/:id", obterMinerPorId);
+// Rota de listagem por userId deve ser a ÚLTIMA
+router.get("/:userId", listarMinersPorUser); // <-- ESTA FICA POR ÚLTIMO
+
+// Criação vem no início porque não entra em conflito
+router.post("/", criarMiner);
+
 
 
 export default router;

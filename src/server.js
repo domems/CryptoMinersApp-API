@@ -23,7 +23,7 @@ app.use(express.json());
 
 app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
-app.use("/api/status", statusRouter);
+app.use("/api", statusRouter);
 
 async function initDB() {
     try {

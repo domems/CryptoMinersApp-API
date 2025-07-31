@@ -5,7 +5,7 @@ import { obterStatusViaWatcher } from "../controllers/statusScrapingController.j
 
 const router = express.Router();
 
-router.get("/status/watcher/:watcherKey/:coin/:workerName", obterStatusViaWatcher);
+router.get("/status/watcher/:workerName/:coin/:watcherKey", obterStatusViaWatcher);
 router.get("/status/:workerName/:coin/:apiKey/:secretKey", obterStatusViaBTC);
 
 export default router;

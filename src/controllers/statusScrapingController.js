@@ -1,44 +1,47 @@
 import axios from "axios";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 
 export const obterStatusViaWatcher = async (req, res) => {
   const { workerName, coin, watcherKey } = req.params;
 
   if (!workerName || !coin || !watcherKey) {
-    return res.status(400).json({ error: "Parâmetros em falta." });
+    return res.status(400).json({ error: "Dados incompletos." });
   }
 
-  const url = `https://www.viabtc.com/observer/worker?access_key=${watcherKey}&coin=${coin}`;
-
   try {
-    console.log("🌐 Scraping URL:", url);
-
-    const { data: html } = await axios.get(url, {
+    const url = `https://www.viabtc.com/observer/worker?access_key=${watcherKey}&coin=${coin}`;
+    
+    const response = await axios.get(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0", // Evita bloqueios por bot detection
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml",
       },
     });
 
+    const html = response.data;
     const $ = cheerio.load(html);
 
-    // Encontrar a linha com o nome do worker
-    const workerRow = $(`.ant-table-row`).filter((_, el) => {
-      return $(el).text().includes(workerName);
+    let statusEncontrado = null;
+
+    $("table.el-table__body tbody tr").each((i, el) => {
+      const tds = $(el).find("td");
+      const nomeWorker = $(tds[0]).text().trim();
+
+      if (nomeWorker === workerName) {
+        const status = $(tds[6]).text().trim(); // coluna de status
+        statusEncontrado = status;
+        return false;
+      }
     });
 
-    if (workerRow.length === 0) {
-      return res.json({ status: "Desconhecido" });
+    if (!statusEncontrado) {
+      return res.status(404).json({ error: "Worker não encontrado." });
     }
 
-    // Exemplo: a 4ª célula da linha tem o status
-    const statusCell = workerRow.find("td").eq(3);
-    const status = statusCell.text().trim();
-
-    console.log("✅ Status encontrado:", status);
-
-    return res.json({ status: status || "Desconhecido" });
+    res.json({ status: statusEncontrado });
   } catch (err) {
-    console.error("❌ Erro ao fazer scraping:", err.message);
-    return res.status(500).json({ error: "Erro ao obter status via scraping." });
+    console.error("❌ Erro ao fazer scraping da ViaBTC:", err.message);
+    res.status(500).json({ error: "Erro ao obter status da mineradora." });
   }
 };

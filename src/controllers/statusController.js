@@ -44,11 +44,8 @@ export const obterStatusViaBTC = async (req, res) => {
       signature,
     };
 
-    const { data } = await axios.post(
-      "https://www.viabtc.com/api/v1/private/worker/status",
-      body,
-      config
-    );
+    const { data } = await axios.post("https://api.viabtc.com/v1/private/worker/status", body, config);
+
 
     const status = data?.data?.status || "Desconhecido";
 

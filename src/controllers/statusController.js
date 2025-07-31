@@ -1,6 +1,9 @@
+// controllers/statusController.js
+
 import crypto from "crypto";
 import axios from "axios";
 
+// Função para gerar a assinatura exigida pela API da ViaBTC
 function gerarAssinatura(secretKey, params) {
   const sortedKeys = Object.keys(params).sort();
   const paramString = sortedKeys.map((k) => `${k}=${params[k]}`).join("&");
@@ -8,7 +11,11 @@ function gerarAssinatura(secretKey, params) {
 }
 
 export const obterStatusViaBTC = async (req, res) => {
-  const { workerName, coin, apiKey, secretKey } = req.params;
+  // Decodifica parâmetros da URL
+  const workerName = decodeURIComponent(req.params.workerName);
+  const coin = decodeURIComponent(req.params.coin);
+  const apiKey = decodeURIComponent(req.params.apiKey);
+  const secretKey = decodeURIComponent(req.params.secretKey);
 
   if (!apiKey || !secretKey || !coin || !workerName) {
     return res.status(400).json({ error: "Dados incompletos." });
@@ -37,7 +44,11 @@ export const obterStatusViaBTC = async (req, res) => {
       signature,
     };
 
-    const { data } = await axios.post("https://www.viabtc.com/api/v1/private/worker/status", body, config);
+    const { data } = await axios.post(
+      "https://www.viabtc.com/api/v1/private/worker/status",
+      body,
+      config
+    );
 
     const status = data?.data?.status || "Desconhecido";
 

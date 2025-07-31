@@ -1,7 +1,6 @@
 import crypto from "crypto";
 import axios from "axios";
 
-// Gera a assinatura HMAC-SHA256 exigida pela API da ViaBTC
 function gerarAssinatura(secretKey, params) {
   const sortedKeys = Object.keys(params).sort();
   const paramString = sortedKeys.map((k) => `${k}=${params[k]}`).join("&");
@@ -9,9 +8,9 @@ function gerarAssinatura(secretKey, params) {
 }
 
 export const obterStatusViaBTC = async (req, res) => {
-  const { api_key, secret_key, coin, worker_name } = req.body;
+  const { apiKey, secretKey, coin, workerName } = req.params;
 
-  if (!api_key || !secret_key || !coin || !worker_name) {
+  if (!apiKey || !secretKey || !coin || !workerName) {
     return res.status(400).json({ error: "Dados incompletos." });
   }
 
@@ -19,13 +18,13 @@ export const obterStatusViaBTC = async (req, res) => {
     const tonce = Date.now();
 
     const params = {
-      access_key: api_key,
+      access_key: apiKey,
       coin: coin.toLowerCase(),
-      worker: worker_name,
+      worker: workerName,
       tonce,
     };
 
-    const signature = gerarAssinatura(secret_key, params);
+    const signature = gerarAssinatura(secretKey, params);
 
     const config = {
       headers: {

@@ -8,7 +8,7 @@ function gerarAssinatura(secretKey, params) {
 }
 
 export const obterStatusViaBTC = async (req, res) => {
-  const { apiKey, secretKey, coin, workerName } = req.params;
+  const { workerName, coin, apiKey, secretKey } = req.params;
 
   if (!apiKey || !secretKey || !coin || !workerName) {
     return res.status(400).json({ error: "Dados incompletos." });

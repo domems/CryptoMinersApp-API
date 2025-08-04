@@ -1,31 +1,28 @@
 import express from "express";
 import dotenv from "dotenv";
-import {sql} from "./config/db.js";
+import { sql } from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
-import statusRouter from "./routes/status.js";
+import statusRouter from "./routes/status.js"; // import ES module
 
 dotenv.config();
 
-
-
-
 const PORT = process.env.PORT || 5001;
-
 const app = express();
 
-
-//middleware
+// middleware
 app.use(rateLimiter);
 app.use(express.json());
 
-const statusRoutes = require('./routes/statusRoutes');
-app.use('/status', statusRoutes);
-app.use("/api/clerk", clerkRoutes);
-app.use("/api/miners", minerRoutes);
-app.use("/api", statusRouter);
+// monta as rotas
+app.use('/api/clerk', clerkRoutes);
+app.use('/api/miners', minerRoutes);
+app.use('/api/status', statusRouter); // <‑‑ prefixo /api/status
 
+
+
+// ... resto do servidor (initDB, etc.)
 async function initDB() {
     try {
     await sql`

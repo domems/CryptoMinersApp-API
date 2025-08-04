@@ -1,6 +1,10 @@
-const { getWorkerStatus } = require('../utils/viaBTC');
+import { getWorkerStatus } from '../utils/viaBTC.js';
 
-exports.getStatus = async (req, res) => {
+/**
+ * Controlador que responde com o estado de um worker.
+ * Espera parâmetros da rota: :workerName, :coin, :watcherCode
+ */
+export const getStatus = async (req, res) => {
   const { workerName, coin, watcherCode } = req.params;
   try {
     const status = await getWorkerStatus(watcherCode, coin, workerName);

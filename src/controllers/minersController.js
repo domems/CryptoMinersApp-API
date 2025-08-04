@@ -113,11 +113,10 @@ export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
   const {
     worker_name,
-    api_key,
-    secret_key,
+    watcherCode, // <-- extrai o watcherCode do corpo
     coin
   } = req.body;
-
+  
   try {
     const [updatedMiner] = await sql`
       UPDATE miners

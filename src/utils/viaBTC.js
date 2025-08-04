@@ -12,7 +12,11 @@ export async function getWorkerStatus(watcherCode, coin, workerName) {
   const url = `https://www.viabtc.com/observer/worker?access_key=${watcherCode}&coin=${coin}`;
   let browser;
   try {
-    browser = await puppeteer.launch({ headless: true });
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath: '/usr/bin/google-chrome' // ou '/usr/bin/chromium-browser' consoante o ambiente
+    });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.waitForSelector('table tbody tr td:nth-child(1) div', { timeout: 20000 });

@@ -14,10 +14,6 @@ export async function getWorkerStatus(watcherCode, coin, workerName) {
   try {
     browser = await puppeteer.launch({
       headless: true,
-      executablePath: 
-        process.env.NODE_ENV === 'production' 
-          ? process.env.PUPPETEER_EXECUTABLE_PATH
-          : puppeteer.executablePath(), // usa o browser que o puppeteer descarregou
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process', '--no-zygote'],
     });
     const page = await browser.newPage();

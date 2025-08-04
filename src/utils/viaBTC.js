@@ -14,8 +14,8 @@ export async function getWorkerStatus(watcherCode, coin, workerName) {
   try {
     browser = await puppeteer.launch({
       headless: true,
+      executablePath: puppeteer.executablePath(), // usa o browser que o puppeteer descarregou
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      executablePath: '/usr/bin/google-chrome' // ou '/usr/bin/chromium-browser' consoante o ambiente
     });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });

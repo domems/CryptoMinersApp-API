@@ -17,17 +17,18 @@ export const criarMiner = async (req, res) => {
     worker_name,
     api_key,
     secret_key,
-    coin
+    coin,
+    watcherCode,
   } = req.body;
 
   try {
     const [novoMiner] = await sql`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
-        worker_name, api_key, secret_key, coin
+        worker_name, api_key, secret_key, coin, watcherCode
       ) VALUES (
         ${user_id}, ${nome}, ${modelo}, ${hash_rate}, ${preco_kw}, ${consumo_kw_hora}, 'offline',
-        ${worker_name}, ${api_key}, ${secret_key}, ${coin}
+        ${worker_name}, ${api_key}, ${secret_key}, ${coin}, ${watcherCode}
       )
       RETURNING *;
     `;
@@ -123,6 +124,7 @@ export const atualizarMinerComoCliente = async (req, res) => {
       SET worker_name = ${worker_name},
           api_key = ${api_key},
           secret_key = ${secret_key},
+          watcherCode = ${watcherCode},
           coin = ${coin}
       WHERE id = ${id}
       RETURNING *;

@@ -4,7 +4,7 @@ import { sql } from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
-import statusRouter from "./routes/status.js"; // import ES module
+import statusRouter from "./routes/statusRoutes.js"; // import ES module
 
 dotenv.config();
 

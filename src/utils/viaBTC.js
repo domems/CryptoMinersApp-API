@@ -1,6 +1,5 @@
 // Usa ES modules; importa puppeteer normalmente
 import puppeteer from 'puppeteer';
-require("dotenv").config();
 
 /**
  * Abre a página do Watcher e devolve o estado de um worker pelo nome.

@@ -1,0 +1,20 @@
+# fly.toml app configuration file generated for cryptominers-api on 2025-07-31T14:11:13+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'cryptominers-api'
+primary_region = 'cdg'
+
+[build]
+
+[http_service]
+  internal_port = 5001
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  size = 'shared-cpu-8x'

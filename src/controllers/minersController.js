@@ -108,21 +108,18 @@ export const atualizarMinerComoAdmin = async (req, res) => {
   }
 };
 
-// Atualização feita por cliente (worker_name, api_key, secret_key, coin)
 export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
   const {
     worker_name,
-    watcherCode, // <-- extrai o watcherCode do corpo
+    watcherCode,
     coin
   } = req.body;
-  
+
   try {
     const [updatedMiner] = await sql`
       UPDATE miners
       SET worker_name = ${worker_name},
-          api_key = ${api_key},
-          secret_key = ${secret_key},
           watcherCode = ${watcherCode},
           coin = ${coin}
       WHERE id = ${id}

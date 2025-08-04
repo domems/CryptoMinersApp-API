@@ -1,5 +1,6 @@
 // Usa ES modules; importa puppeteer normalmente
 import puppeteer from 'puppeteer';
+require("dotenv").config();
 
 /**
  * Abre a página do Watcher e devolve o estado de um worker pelo nome.
@@ -14,8 +15,11 @@ export async function getWorkerStatus(watcherCode, coin, workerName) {
   try {
     browser = await puppeteer.launch({
       headless: true,
-      executablePath: puppeteer.executablePath(), // usa o browser que o puppeteer descarregou
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath: 
+        process.env.NODE_ENV === 'production' 
+          ? process.env.PUPPETEER_EXECUTABLE_PATH
+          : puppeteer.executablePath(), // usa o browser que o puppeteer descarregou
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process', '--no-zygote'],
     });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });

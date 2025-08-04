@@ -1,8 +1,10 @@
-const express = require('express');
-const router  = express.Router();
-const { getStatus } = require('../controllers/statusController');
+// src/routes/statusRoutes.js
+import express from 'express';
+import { getStatus } from '../controllers/statusController.js';
 
-// GET /status/:workerName/:coin/:watcherCode
+const router = express.Router();
+
+// GET /api/status/:workerName/:coin/:watcherCode
 router.get('/:workerName/:coin/:watcherCode', getStatus);
 
-module.exports = router;
+export default router;  // <-- aqui a exportação default

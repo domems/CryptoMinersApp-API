@@ -5,7 +5,6 @@ import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRouter from "./routes/status.js";
-import workerRoutes from "./routes/workerRoutes.js";
 
 dotenv.config();
 
@@ -21,11 +20,11 @@ const app = express();
 app.use(rateLimiter);
 app.use(express.json());
 
-
+const statusRoutes = require('./routes/statusRoutes');
+app.use('/status', statusRoutes);
 app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
 app.use("/api", statusRouter);
-app.use('/api/workers', workerRoutes);
 
 async function initDB() {
     try {

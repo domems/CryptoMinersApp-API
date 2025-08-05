@@ -4,8 +4,8 @@ import { sql } from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
-import statusRouter from "./routes/statusRoutes.js"; // import ES module
 import viabtcRoutes from "./routes/viabtcRoutes.js";
+import storeMinersRoutes from "./routes/storeMiners.js";
 
 dotenv.config();
 
@@ -19,8 +19,8 @@ app.use(express.json());
 // monta as rotas
 app.use('/api/clerk', clerkRoutes);
 app.use('/api/miners', minerRoutes);
-app.use('/api/status', statusRouter); // <‑‑ prefixo /api/status
 app.use("/api", viabtcRoutes);
+app.use("/api/store-miners", storeMinersRoutes);
 
 
 // ... resto do servidor (initDB, etc.)

@@ -37,7 +37,18 @@ export async function getViaBTCData(req, res) {
     }
 
     // 5. Retornar resposta JSON da API
-    return res.json(data);
+    const workers = data.data?.data?.map(worker => ({
+      worker_name: worker.worker_name,
+      worker_status: worker.worker_status,
+      hashrate_10min: worker.hashrate_10min
+    }));
+
+    return res.json({
+      total: workers.length,
+      active: workers.filter(w => w.worker_status === "active").length,
+      unactive: workers.filter(w => w.worker_status === "unactive").length,
+      workers
+    });
 
   } catch (err) {
     console.error("❌ Erro no controller getViaBTCData:", err);

@@ -22,18 +22,20 @@ export async function createStoreMiner(req, res) {
       quantidade,
       descricao,
       imagem_url,
+      coin,
     } = req.body;
 
-    if (!nome || !modelo || !hash_rate || !consumo_kw || !preco) {
+    if (!nome || !modelo || !hash_rate || !consumo_kw || !preco || !coin) {
       return res.status(400).json({ error: "Preencha todos os campos obrigatórios." });
     }
 
     const result = await sql`
       INSERT INTO store_miners (
-        nome, modelo, hash_rate, consumo_kw, preco, quantidade, descricao, imagem_url
-      ) VALUES (
-        ${nome}, ${modelo}, ${hash_rate}, ${consumo_kw}, ${preco}, ${quantidade || 1}, ${descricao || ""}, ${imagem_url || ""}
-      ) RETURNING *;
+        nome, modelo, hash_rate, consumo_kw, preco, quantidade, descricao, imagem_url, coin
+        ) VALUES (
+        ${nome}, ${modelo}, ${hash_rate}, ${consumo_kw}, ${preco}, ${quantidade || 1}, ${descricao || ""}, ${imagem_url || ""}, ${coin}
+        )
+        RETURNING *;
     `;
 
     res.status(201).json(result[0]);

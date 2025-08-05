@@ -1,14 +1,13 @@
 import { sql } from "../config/db.js";
-import crypto from "crypto";
 import fetch from "node-fetch";
 
 export async function getViaBTCData(req, res) {
   try {
     const { minerId } = req.params;
 
-    // Buscar API key, secret_key e coin
+    // 1. Buscar api_key e coin da BD
     const result = await sql`
-      SELECT api_key, secret_key, coin
+      SELECT api_key, coin
       FROM miners
       WHERE id = ${minerId}
     `;
@@ -17,39 +16,31 @@ export async function getViaBTCData(req, res) {
       return res.status(404).json({ error: "Miner não encontrado." });
     }
 
-    const {
-      api_key,
-      secret_key,
-      coin
-    } = result[0];
+    const { api_key, coin } = result[0];
 
-    // Parâmetros da query
-    const tonce = Date.now();
-    const params = { coin, tonce };
-    const queryString = new URLSearchParams(params).toString();
+    // 2. Endpoint OpenAPI da ViaBTC para lista de workers
+    const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
 
-    // Assinatura HMAC-SHA256
-    const signature = crypto
-      .createHmac("sha256", secret_key)
-      .update(queryString)
-      .digest("hex");
-
-    // URL completa
-    const url = `https://pool.viabtc.com/res/openapi/v1/account/sub/hashrate?${queryString}`;
-
-    // Fazer o request com X-API-KEY e X-SIGNATURE
+    // 3. Fazer pedido com X-API-KEY
     const response = await fetch(url, {
       headers: {
-        "X-API-KEY": api_key,
-        "X-SIGNATURE": signature
+        "X-API-KEY": api_key
       }
     });
 
     const data = await response.json();
+
+    // 4. Validar resposta
+    if (!data || data.code !== 0) {
+      console.error("Erro da API:", data);
+      return res.status(502).json({ error: "Erro na API da ViaBTC", detalhe: data?.message || "Erro desconhecido" });
+    }
+
+    // 5. Retornar resposta JSON da API
     return res.json(data);
 
   } catch (err) {
-    console.error("Erro ao chamar a OpenAPI da ViaBTC:", err);
-    return res.status(500).json({ error: "Erro ao chamar a OpenAPI da ViaBTC." });
+    console.error("❌ Erro no controller getViaBTCData:", err);
+    return res.status(500).json({ error: "Erro interno ao chamar a API da ViaBTC." });
   }
 }

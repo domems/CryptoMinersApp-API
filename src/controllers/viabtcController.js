@@ -1,31 +1,38 @@
 import { sql } from "../config/db.js";
-import crypto from "crypto";
 import fetch from "node-fetch";
 
 export async function getViaBTCData(req, res) {
   try {
     const { minerId } = req.params;
-    const result = await sql`SELECT api_key, secret_key, coin FROM miners WHERE id = ${minerId}`;
-    if (result.length === 0) return res.status(404).json({ error: "Miner não encontrado." });
 
-    const { api_key, secret_key, coin } = result[0];
-    const tonce = Date.now();
-    const params = { access_id: api_key, coin, tonce };
-    const sortedKeys = Object.keys(params).sort();
-    const queryString = sortedKeys.map(k => `${k}=${params[k]}`).join("&");
+    // Vamos buscar apenas a API key (não é necessário secret_key)
+    const result = await sql`
+      SELECT api_key, coin
+      FROM miners
+      WHERE id = ${minerId}
+    `;
 
-    const sign = crypto
-      .createHash("sha1")
-      .update(`${queryString}&secret_key=${secret_key}`)
-      .digest("hex");
+    if (result.length === 0) {
+      return res.status(404).json({ error: "Miner não encontrado." });
+    }
 
-    const url = `https://api.viabtc.com/v1/pool/worker/list?${queryString}&sign=${sign}`;
-    const response = await fetch(url);
+    const { api_key, coin } = result[0];
+
+    // Endpoint da OpenAPI
+    const url = `https://www.viabtc.net/res/openapi/v1/hashrate?coin=${coin}`;
+
+    // Fazer o pedido com o header 'X-API-KEY'
+    const response = await fetch(url, {
+      headers: {
+        "X-API-KEY": api_key
+      }
+    });
+
     const data = await response.json();
-
     return res.json(data);
+
   } catch (err) {
-    console.error("Erro API ViaBTC:", err);
-    res.status(500).json({ error: "Erro ao chamar a API." });
+    console.error("Erro ao chamar a OpenAPI da ViaBTC:", err);
+    return res.status(500).json({ error: "Erro ao chamar a OpenAPI da ViaBTC." });
   }
 }

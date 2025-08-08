@@ -1,11 +1,9 @@
 import { sql } from "../config/db.js";
 
 // Lista de emails de administradores
-const adminEmails = [
-  "domems@gmail.com", 
-  "admin2@email.com"
-];
+const adminEmails = ["domems@gmail.com", "admin2@email.com"];
 
+// Criar nova mineradora
 export const criarMiner = async (req, res) => {
   const {
     user_id,
@@ -18,17 +16,17 @@ export const criarMiner = async (req, res) => {
     api_key,
     secret_key,
     coin,
-    watchercode,
+    pool,
   } = req.body;
 
   try {
     const [novoMiner] = await sql`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
-        worker_name, api_key, secret_key, coin, watchercode
+        worker_name, api_key, secret_key, coin, pool
       ) VALUES (
         ${user_id}, ${nome}, ${modelo}, ${hash_rate}, ${preco_kw}, ${consumo_kw_hora}, 'offline',
-        ${worker_name}, ${api_key}, ${secret_key}, ${coin}, ${watchercode}
+        ${worker_name}, ${api_key}, ${secret_key}, ${coin}, ${pool}
       )
       RETURNING *;
     `;
@@ -39,41 +37,33 @@ export const criarMiner = async (req, res) => {
   }
 };
 
-export const listarMinersPorUser = async (req, res) => {
-  const { userId } = req.params;
-
-  try {
-    const miners = await sql`
-      SELECT * FROM miners
-      WHERE user_id = ${userId}
-      ORDER BY created_at DESC;
-    `;
-    res.json(miners);
-  } catch (err) {
-    console.error("Erro ao listar miners:", err);
-    res.status(500).json({ error: "Erro ao buscar miners" });
-  }
-};
-
-export const atualizarStatusMiner = async (req, res) => {
+// Atualização por cliente (pode alterar: worker_name, api_key, coin, pool)
+export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { worker_name, api_key, coin, pool } = req.body;
+
+  if (!worker_name || !api_key || !coin || !pool) {
+    return res.status(400).json({ error: "Todos os campos são obrigatórios." });
+  }
 
   try {
     const [updatedMiner] = await sql`
       UPDATE miners
-      SET status = ${status}
+      SET worker_name = ${worker_name},
+          api_key = ${api_key},
+          coin = ${coin},
+          pool = ${pool}
       WHERE id = ${id}
       RETURNING *;
     `;
     res.json(updatedMiner);
   } catch (err) {
-    console.error("Erro ao atualizar status:", err);
-    res.status(500).json({ error: "Erro ao atualizar status do miner" });
+    console.error("Erro ao atualizar miner (cliente):", err);
+    res.status(500).json({ error: "Erro ao atualizar miner (cliente)" });
   }
 };
 
-// Atualização feita por admin (todos os campos exceto credenciais/API)
+// Atualização feita por admin (dados técnicos)
 export const atualizarMinerComoAdmin = async (req, res) => {
   const { id } = req.params;
   const userEmail = req.header("x-user-email");
@@ -82,13 +72,7 @@ export const atualizarMinerComoAdmin = async (req, res) => {
     return res.status(403).json({ error: "Acesso negado. Apenas admins podem editar todos os campos." });
   }
 
-  const {
-    nome,
-    modelo,
-    hash_rate,
-    preco_kw,
-    consumo_kw_hora
-  } = req.body;
+  const { nome, modelo, hash_rate, preco_kw, consumo_kw_hora } = req.body;
 
   try {
     const [updatedMiner] = await sql`
@@ -108,43 +92,7 @@ export const atualizarMinerComoAdmin = async (req, res) => {
   }
 };
 
-export const atualizarMinerComoCliente = async (req, res) => {
-  const { id } = req.params;
-  const {
-    worker_name,
-    watcherCode,
-    coin
-  } = req.body;
-
-  try {
-    const [updatedMiner] = await sql`
-      UPDATE miners
-      SET worker_name = ${worker_name},
-          watchercode = ${watcherCode},
-          coin = ${coin}
-      WHERE id = ${id}
-      RETURNING *;
-    `;
-    res.json(updatedMiner);
-  } catch (err) {
-    console.error("Erro ao atualizar miner (cliente):", err);
-    res.status(500).json({ error: "Erro ao atualizar miner (cliente)" });
-  }
-};
-
-export const apagarMiner = async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    await sql`DELETE FROM miners WHERE id = ${id}`;
-    res.status(204).send();
-  } catch (err) {
-    console.error("Erro ao apagar miner:", err);
-    res.status(500).json({ error: "Erro ao apagar miner" });
-  }
-};
-
-// Obter miner por ID
+// Obter mineradora por ID
 export const obterMinerPorId = async (req, res) => {
   const { id } = req.params;
 
@@ -156,5 +104,54 @@ export const obterMinerPorId = async (req, res) => {
   } catch (err) {
     console.error("Erro ao buscar miner:", err);
     res.status(500).json({ error: "Erro ao buscar mineradora" });
+  }
+};
+
+// Listar mineradoras de um utilizador
+export const listarMinersPorUser = async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const miners = await sql`
+      SELECT * FROM miners
+      WHERE user_id = ${userId}
+      ORDER BY created_at DESC;
+    `;
+    res.json(miners);
+  } catch (err) {
+    console.error("Erro ao listar miners:", err);
+    res.status(500).json({ error: "Erro ao buscar miners" });
+  }
+};
+
+// Atualizar status (online/offline)
+export const atualizarStatusMiner = async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  try {
+    const [updatedMiner] = await sql`
+      UPDATE miners
+      SET status = ${status}
+      WHERE id = ${id}
+      RETURNING *;
+    `;
+    res.json(updatedMiner);
+  } catch (err) {
+    console.error("Erro ao atualizar status:", err);
+    res.status(500).json({ error: "Erro ao atualizar status do miner" });
+  }
+};
+
+// Apagar mineradora
+export const apagarMiner = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await sql`DELETE FROM miners WHERE id = ${id}`;
+    res.status(204).send();
+  } catch (err) {
+    console.error("Erro ao apagar miner:", err);
+    res.status(500).json({ error: "Erro ao apagar miner" });
   }
 };

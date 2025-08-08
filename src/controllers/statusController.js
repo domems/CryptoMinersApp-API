@@ -56,8 +56,8 @@ export async function getMinerStatus(req, res) {
 
       const workers = Object.entries(data.workers).map(([name, info]) => ({
         worker_name: name,
-        worker_status: info.alive ? "active" : "unactive",
-        hashrate_10min: info.hashrate
+        worker_status: info.connected ? "active" : "unactive",
+        hashrate_10min: info.hash_rate * 1000 // Convert kH/s to H/s
       }));
 
       return res.json({

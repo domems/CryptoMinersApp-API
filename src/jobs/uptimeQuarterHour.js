@@ -2,9 +2,8 @@
 import cron from "node-cron";
 import fetch from "node-fetch";
 import { sql } from "../config/db.js";
-import { redis } from "../config/upstash.js";
 
-/** Arredonda para o início do quarto de hora (UTC) em ISO */
+/** Arredonda para o início do quarto de hora (UTC) em ISO — só para logs */
 function floorToQuarterISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
@@ -12,7 +11,7 @@ function floorToQuarterISO(d = new Date()) {
   return t.toISOString();
 }
 
-/** ---------- Helpers de matching ---------- */
+/* ---------- helpers de matching ---------- */
 const norm = (s) => String(s ?? "").trim();
 const low = (s) => norm(s).toLowerCase();
 const lastToken = (s) => {
@@ -20,71 +19,50 @@ const lastToken = (s) => {
   return parts.length ? parts[parts.length - 1] : norm(s);
 };
 
-/** Match robusto: igual, case-insensitive, termina com .worker, ou último token */
+/** Match robusto: igual, case-insensitive, termina com ".worker", ou último token */
 function matchWorkerName(apiName, dbName) {
   const a = norm(apiName);
   const b = norm(dbName);
   if (!a || !b) return false;
-
   if (a === b) return true;
   if (low(a) === low(b)) return true;
   if (a.endsWith(`.${b}`)) return true;
   if (low(a).endsWith(`.${low(b)}`)) return true;
   if (low(lastToken(a)) === low(b)) return true;
-
   return false;
 }
 
-/** ---------- ViaBTC ---------- */
+/* ---------- ViaBTC ---------- */
 async function fetchViaBTCList(apiKey, coinRaw) {
-  // Mantemos o coin como está na BD (se usas "LTC", passa "LTC")
   const coin = String(coinRaw ?? "");
   const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
   const resp = await fetch(url, { headers: { "X-API-KEY": apiKey } });
   const data = await resp.json().catch(() => null);
-
   if (!data || data.code !== 0 || !Array.isArray(data.data?.data)) {
-    console.warn("[uptime] ViaBTC resposta inesperada:", data);
     return [];
   }
-
-  // devolvemos só o que precisamos
   return data.data.data.map((w) => ({
-    worker_name: String(w.worker_name),           // ex: "acc.001" ou "001"
-    worker_status: String(w.worker_status || ""), // "active" | "unactive" | ...
+    worker_name: String(w.worker_name),            // ex: "acc.001" ou "001"
+    worker_status: String(w.worker_status || ""),  // "active" | "unactive" | ...
     hashrate_10min: Number(w.hashrate_10min || 0),
   }));
 }
 
-/** ---------- LitecoinPool ---------- */
+/* ---------- LitecoinPool ---------- */
 async function fetchLitecoinPoolWorkers(apiKey) {
   const url = `https://www.litecoinpool.org/api?api_key=${apiKey}`;
   const resp = await fetch(url);
   const data = await resp.json().catch(() => null);
-  if (!data || !data.workers) {
-    console.warn("[uptime] LitecoinPool resposta inesperada:", data);
-    return {};
-  }
-  return data.workers; // { name: { connected, ... } }
+  return data && data.workers ? data.workers : {};
 }
 
-/** Corre UM tick (podes chamar manualmente) */
-export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
+/** Corre UM tick (sem lock) — podes chamar por endpoint manual também */
+export async function runUptimeTickOnce() {
   const slotISO = floorToQuarterISO();
-  const lockKey = `uptime:quarter:${slotISO}`;
-
-  if (!ignoreLock) {
-    const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
-    if (!gotLock) {
-      console.log(`[uptime] lock ativo (${slotISO}) – a ignorar duplicado.`);
-      return { ok: true, skipped: true };
-    }
-  }
-
   let totalUpdates = 0;
 
   try {
-    // trazemos só o essencial
+    // 1) miners elegíveis
     const miners = await sql/*sql*/`
       SELECT id, user_id, nome, worker_name, api_key, coin, pool
       FROM miners
@@ -95,7 +73,7 @@ export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
       return { ok: true, updated: 0 };
     }
 
-    // agrupar por (pool, api_key[, coin]) para reduzir chamadas
+    // 2) agrupar por (pool, api_key[, coin])
     const groups = new Map();
     for (const m of miners) {
       const key = `${m.pool}|${m.api_key}|${m.pool === "ViaBTC" ? (m.coin ?? "") : ""}`;
@@ -103,18 +81,15 @@ export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
       groups.get(key).push(m);
     }
 
+    // 3) para cada grupo, buscar status e atualizar em lote
     for (const [key, list] of groups) {
       const [pool, apiKey, coin] = key.split("|");
-      let onlineIds = [];
-      let poolTag = pool === "ViaBTC" ? `ViaBTC(${coin})` : pool;
+      const onlineIds = [];
 
       if (pool === "ViaBTC") {
         const workers = await fetchViaBTCList(apiKey, coin);
-
         for (const m of list) {
-          // procura o worker correspondente
           const w = workers.find((x) => matchWorkerName(x.worker_name, m.worker_name));
-          // ativa se status 'active' OU tem hashrate > 0 (em alguns casos o status pode vir estranho)
           if (w && (w.worker_status === "active" || w.hashrate_10min > 0)) {
             onlineIds.push(m.id);
           }
@@ -128,7 +103,7 @@ export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
           }
         }
       } else {
-        console.warn(`[uptime] pool não suportada no cron: ${pool}`);
+        // outras pools: ignora
       }
 
       if (onlineIds.length) {
@@ -140,6 +115,7 @@ export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
         totalUpdates += onlineIds.length;
       }
 
+      const poolTag = pool === "ViaBTC" ? `ViaBTC(${coin})` : pool;
       console.log(`[uptime] grupo ${poolTag} – workers: ${list.length}, online: ${onlineIds.length}`);
     }
 
@@ -151,7 +127,7 @@ export async function runUptimeTickOnce({ ignoreLock = false } = {}) {
   }
 }
 
-/** Inicia o cron de 15 em 15 minutos (Europe/Lisbon) */
+/** Inicia o cron de 15 em 15 minutos (sem lock) */
 export function startQuarterHourUptime() {
   cron.schedule(
     "*/15 * * * *",

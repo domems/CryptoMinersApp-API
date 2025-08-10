@@ -1,7 +1,7 @@
+// src/jobs/uptimeViaBTC.js
 import cron from "node-cron";
 import fetch from "node-fetch";
 import { sql } from "../config/db.js";
-import { redis } from "../config/upstash.js";
 
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
@@ -56,14 +56,6 @@ function dedupe(ids) {
 export async function runUptimeViaBTCOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
-
-  // lock específico da ViaBTC
-  const lockKey = `uptime:${sISO}:viabtc`;
-  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
-  if (!gotLock) {
-    console.log(`[uptime:viabtc] lock ativo (${sISO}) – ignorado nesta instância.`);
-    return { ok: true, skipped: true };
-  }
 
   let updated = 0;
 

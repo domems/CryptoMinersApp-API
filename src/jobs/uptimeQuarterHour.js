@@ -1,6 +1,6 @@
 // jobs/uptimeQuarterHour.js
 import { sql } from "../config/db.js";
-import { redis } from "../config/ratelimit.js"; 
+import { redis } from "../config/upstash.js"; 
 import fetch from "node-fetch";
 
 export async function runUptimeQuarterHour() {

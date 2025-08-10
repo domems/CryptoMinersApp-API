@@ -10,23 +10,30 @@ function floorToQuarterISO(d = new Date()) {
   return t.toISOString();
 }
 
-function normalizeKey(s) {
-  return String(s ?? "").trim().toLowerCase();
-}
+const norm = (s) => String(s ?? "").trim().toLowerCase();
 
-async function fetchViaBTCMap(apiKey, coin) {
-  const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
+// ==== VIA BTC ====
+// nota: coin em maiúsculas e pedimos 200 por página
+async function fetchViaBTCMap(apiKey, coinRaw) {
+  const coin = String(coinRaw || "").toUpperCase();
+  const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}&page=1&size=200`;
   const resp = await fetch(url, { headers: { "X-API-KEY": apiKey } });
   const data = await resp.json().catch(() => null);
+
   const map = new Map();
   if (data?.code === 0 && Array.isArray(data.data?.data)) {
     for (const w of data.data.data) {
-      map.set(normalizeKey(w.worker_name), w.worker_status === "active");
+      const name = norm(w.worker_name);
+      const online = (w.worker_status === "active") || (Number(w.hashrate_10min) > 0);
+      map.set(name, online);
     }
+  } else {
+    console.warn("[uptime] ViaBTC resposta inesperada:", data);
   }
   return map;
 }
 
+// ==== LITECOINPOOL ====
 async function fetchLitecoinPoolMap(apiKey) {
   const url = `https://www.litecoinpool.org/api?api_key=${apiKey}`;
   const resp = await fetch(url);
@@ -34,8 +41,10 @@ async function fetchLitecoinPoolMap(apiKey) {
   const map = new Map();
   if (data?.workers && typeof data.workers === "object") {
     for (const [name, info] of Object.entries(data.workers)) {
-      map.set(normalizeKey(name), !!(info && info.connected));
+      map.set(norm(name), !!(info && info.connected));
     }
+  } else {
+    console.warn("[uptime] LitecoinPool resposta inesperada:", data);
   }
   return map;
 }
@@ -44,7 +53,6 @@ export async function runUptimeTickOnce() {
   const slotISO = floorToQuarterISO();
   const lockKey = `uptime:quarter:${slotISO}`;
 
-  // lock para evitar duplicação
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
   if (!gotLock) {
     console.log(`[uptime] lock ativo (${slotISO}) – a ignorar duplicado.`);
@@ -63,17 +71,18 @@ export async function runUptimeTickOnce() {
       return { ok: true, updated: 0 };
     }
 
-    // ✅ AGRUPAMENTO CORRETO
+    // agrupar corretamente
     const groups = new Map(); // key -> Miner[]
     for (const m of miners) {
-      const k = `${m.pool}|${m.api_key}|${m.pool === "ViaBTC" ? (m.coin ?? "") : ""}`;
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(m);
+      const key = `${m.pool}|${m.api_key}|${m.pool === "ViaBTC" ? (m.coin ?? "") : ""}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(m);
     }
 
     for (const [key, list] of groups) {
       const [pool, apiKey, coin] = key.split("|");
       let statusMap = new Map();
+
       try {
         statusMap =
           pool === "ViaBTC" ? await fetchViaBTCMap(apiKey, coin) :
@@ -85,8 +94,12 @@ export async function runUptimeTickOnce() {
       }
 
       const onlineIds = [];
+      const unmatched = []; // para debug
       for (const m of list) {
-        const online = !!statusMap.get(normalizeKey(m.worker_name));
+        const keyName = norm(m.worker_name);
+        const has = statusMap.has(keyName);
+        const online = statusMap.get(keyName) === true;
+        if (!has) unmatched.push(m.worker_name);
         if (online) onlineIds.push(m.id);
       }
 
@@ -99,7 +112,11 @@ export async function runUptimeTickOnce() {
         totalUpdates += onlineIds.length;
       }
 
-      console.log(`[uptime] grupo ${pool}${pool==="ViaBTC" ? "("+coin+")" : ""} – workers: ${list.length}, online: ${onlineIds.length}`);
+      const poolTag = pool === "ViaBTC" ? `ViaBTC(${String(coin).toUpperCase()})` : pool;
+      console.log(`[uptime] grupo ${poolTag} – workers: ${list.length}, online: ${onlineIds.length}`);
+      if (unmatched.length) {
+        console.log(`[uptime]   nomes não encontrados (${poolTag}):`, unmatched.join(", "));
+      }
     }
 
     console.log(`[uptime] ${slotISO} – miners atualizadas: ${totalUpdates}`);

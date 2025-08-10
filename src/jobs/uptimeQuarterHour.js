@@ -3,13 +3,37 @@ import cron from "node-cron";
 import fetch from "node-fetch";
 import { sql } from "../config/db.js";
 
-/** Arredonda para o início do quarto de hora (UTC) em ISO — só para logs */
+/** Arredonda para o início do quarto de hora (UTC) em ISO — define o “slot” do tick */
 function floorToQuarterISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
   const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), q, 0));
   return t.toISOString();
 }
+
+/* =================== DEDUP GLOBAL POR SLOT =================== */
+/** Mantém, ao nível do módulo, o último slot e os miners já atualizados nesse slot */
+let lastSlotISO = null;
+const updatedInSlot = new Set(); // Set<number|string>
+
+/** Garante que só atualizamos uma vez por miner em cada slot */
+function beginSlot(slotISO) {
+  if (slotISO !== lastSlotISO) {
+    lastSlotISO = slotISO;
+    updatedInSlot.clear();
+  }
+}
+function markUpdatedOnce(ids) {
+  const unique = [];
+  for (const id of ids) {
+    if (!updatedInSlot.has(id)) {
+      updatedInSlot.add(id);
+      unique.push(id);
+    }
+  }
+  return unique;
+}
+/* ============================================================= */
 
 /* ---------- helpers de matching ---------- */
 const norm = (s) => String(s ?? "").trim();
@@ -56,11 +80,12 @@ async function fetchLitecoinPoolWorkers(apiKey) {
   return data && data.workers ? data.workers : {};
 }
 
-/** Corre UM tick (sem lock) — podes chamar por endpoint manual também */
+/** Corre UM tick (sem lock; com dedup global por slot) — podes chamar por endpoint manual também */
 export async function runUptimeTickOnce() {
   const slotISO = floorToQuarterISO();
+  beginSlot(slotISO); // reseta dedup se avançámos de slot
+
   let totalUpdates = 0;
-  const alreadyUpdated = new Set(); // evita somar duas vezes no mesmo tick
 
   try {
     // 1) miners elegíveis
@@ -85,17 +110,14 @@ export async function runUptimeTickOnce() {
     // 3) para cada grupo, buscar status e atualizar em lote
     for (const [key, list] of groups) {
       const [pool, apiKey, coin] = key.split("|");
-      const onlineIds = [];
+      let candidateIds = [];
 
       if (pool === "ViaBTC") {
         const workers = await fetchViaBTCList(apiKey, coin);
         for (const m of list) {
           const w = workers.find((x) => matchWorkerName(x.worker_name, m.worker_name));
           if (w && (w.worker_status === "active" || w.hashrate_10min > 0)) {
-            if (!alreadyUpdated.has(m.id)) {
-              onlineIds.push(m.id);
-              alreadyUpdated.add(m.id);
-            }
+            candidateIds.push(m.id);
           }
         }
       } else if (pool === "LiteCoinPool") {
@@ -103,15 +125,15 @@ export async function runUptimeTickOnce() {
         for (const m of list) {
           const info = workers?.[m.worker_name];
           if (info && info.connected === true) {
-            if (!alreadyUpdated.has(m.id)) {
-              onlineIds.push(m.id);
-              alreadyUpdated.add(m.id);
-            }
+            candidateIds.push(m.id);
           }
         }
       } else {
         // outras pools: ignora
       }
+
+      // 4) aplica deduplicação global por slot antes de atualizar
+      const onlineIds = markUpdatedOnce(candidateIds);
 
       if (onlineIds.length) {
         await sql/*sql*/`
@@ -134,7 +156,7 @@ export async function runUptimeTickOnce() {
   }
 }
 
-/** Inicia o cron de 15 em 15 minutos (sem lock) */
+/** Inicia o cron de 15 em 15 minutos (sem lock; com dedup global por slot) */
 export function startQuarterHourUptime() {
   cron.schedule(
     "*/15 * * * *",

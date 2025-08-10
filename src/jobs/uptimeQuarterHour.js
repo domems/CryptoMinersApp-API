@@ -3,12 +3,15 @@ import { sql } from "../config/db.js";
 import fetch from "node-fetch";
 import { redis } from "../config/upstash.js";
 
-// --- utils --- //
 function floorToQuarterISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
   const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), q, 0));
-  return t.toISOString(); // ex: 2025-08-10T12:45:00.000Z
+  return t.toISOString();
+}
+
+function normalizeKey(s) {
+  return String(s ?? "").trim().toLowerCase();
 }
 
 async function fetchViaBTCMap(apiKey, coin) {
@@ -18,7 +21,7 @@ async function fetchViaBTCMap(apiKey, coin) {
   const map = new Map();
   if (data?.code === 0 && Array.isArray(data.data?.data)) {
     for (const w of data.data.data) {
-      map.set(String(w.worker_name), w.worker_status === "active");
+      map.set(normalizeKey(w.worker_name), w.worker_status === "active");
     }
   }
   return map;
@@ -31,85 +34,84 @@ async function fetchLitecoinPoolMap(apiKey) {
   const map = new Map();
   if (data?.workers && typeof data.workers === "object") {
     for (const [name, info] of Object.entries(data.workers)) {
-      map.set(String(name), !!info.connected);
+      map.set(normalizeKey(name), !!(info && info.connected));
     }
   }
   return map;
 }
 
-export function startQuarterHourUptime() {
-  // corre de 15 em 15 minutos
-  cron.schedule(
-    "*/15 * * * *",
-    async () => {
-      const slotISO = floorToQuarterISO();              // janela de 15 min
-      const lockKey = `uptime:quarter:${slotISO}`;
+export async function runUptimeTickOnce() {
+  const slotISO = floorToQuarterISO();
+  const lockKey = `uptime:quarter:${slotISO}`;
 
-      // 1) LOCK distribuído: impede duplicação do job nesta janela
-      const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
-      if (!gotLock) {
-        console.log(`[uptime] lock ativo (${slotISO}) – a ignorar duplicado.`);
-        return;
-      }
+  // lock para evitar duplicação
+  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
+  if (!gotLock) {
+    console.log(`[uptime] lock ativo (${slotISO}) – a ignorar duplicado.`);
+    return { ok: true, skipped: true };
+  }
 
+  let totalUpdates = 0;
+  try {
+    const miners = await sql/*sql*/`
+      SELECT id, user_id, nome, worker_name, api_key, coin, pool
+      FROM miners
+      WHERE api_key IS NOT NULL AND worker_name IS NOT NULL AND pool IS NOT NULL
+    `;
+    if (!miners.length) {
+      console.log("[uptime] sem miners elegíveis.");
+      return { ok: true, updated: 0 };
+    }
+
+    // ✅ AGRUPAMENTO CORRETO
+    const groups = new Map(); // key -> Miner[]
+    for (const m of miners) {
+      const k = `${m.pool}|${m.api_key}|${m.pool === "ViaBTC" ? (m.coin ?? "") : ""}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(m);
+    }
+
+    for (const [key, list] of groups) {
+      const [pool, apiKey, coin] = key.split("|");
+      let statusMap = new Map();
       try {
-        // 2) Carregar miners com credenciais
-        const miners = await sql/*sql*/`
-          SELECT id, user_id, nome, worker_name, api_key, coin, pool
-          FROM miners
-          WHERE api_key IS NOT NULL AND worker_name IS NOT NULL AND pool IS NOT NULL
-        `;
-        if (!miners.length) {
-          console.log("[uptime] sem miners elegíveis.");
-          return;
-        }
-
-        // 3) Agrupar por (pool, api_key[, coin]) – 1 chamada por grupo
-        const groups = new Map();
-        for (const m of miners) {
-          const key = `${m.pool}|${m.api_key}|${m.pool === "ViaBTC" ? (m.coin ?? "") : ""}`;
-          (groups.get(key) || groups.set(key, []).get(key)).push(m);
-        }
-
-        let totalUpdates = 0;
-
-        // 4) Para cada grupo, obter status map e fazer update em lote
-        for (const [key, list] of groups) {
-          const [pool, apiKey, coin] = key.split("|");
-          let statusMap = new Map();
-
-          try {
-            if (pool === "ViaBTC") statusMap = await fetchViaBTCMap(apiKey, coin);
-            else if (pool === "LiteCoinPool") statusMap = await fetchLitecoinPoolMap(apiKey);
-            else statusMap = new Map();
-          } catch (e) {
-            console.error(`[uptime] erro a buscar ${pool}:`, e);
-            continue;
-          }
-
-          const onlineIds = [];
-          for (const m of list) {
-            const online = !!statusMap.get(String(m.worker_name));
-            if (online) onlineIds.push(m.id);
-          }
-
-          if (onlineIds.length) {
-            await sql/*sql*/`
-              UPDATE miners
-              SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
-              WHERE id = ANY(${onlineIds})
-            `;
-            totalUpdates += onlineIds.length;
-          }
-        }
-
-        console.log(`[uptime] ${slotISO} – miners atualizadas: ${totalUpdates}`);
+        statusMap =
+          pool === "ViaBTC" ? await fetchViaBTCMap(apiKey, coin) :
+          pool === "LiteCoinPool" ? await fetchLitecoinPoolMap(apiKey) :
+          new Map();
       } catch (e) {
-        console.error("⛔ uptimeQuarterHour:", e);
-      } finally {
-        // o lock expira sozinho; não precisamos dar DEL
+        console.error(`[uptime] erro a buscar ${pool}:`, e);
+        continue;
       }
-    },
-    { timezone: "Europe/Lisbon" }
-  );
+
+      const onlineIds = [];
+      for (const m of list) {
+        const online = !!statusMap.get(normalizeKey(m.worker_name));
+        if (online) onlineIds.push(m.id);
+      }
+
+      if (onlineIds.length) {
+        await sql/*sql*/`
+          UPDATE miners
+          SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
+          WHERE id = ANY(${onlineIds})
+        `;
+        totalUpdates += onlineIds.length;
+      }
+
+      console.log(`[uptime] grupo ${pool}${pool==="ViaBTC" ? "("+coin+")" : ""} – workers: ${list.length}, online: ${onlineIds.length}`);
+    }
+
+    console.log(`[uptime] ${slotISO} – miners atualizadas: ${totalUpdates}`);
+    return { ok: true, updated: totalUpdates };
+  } catch (e) {
+    console.error("⛔ uptimeQuarterHour:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+export function startQuarterHourUptime() {
+  cron.schedule("*/15 * * * *", async () => {
+    await runUptimeTickOnce();
+  }, { timezone: "Europe/Lisbon" });
 }

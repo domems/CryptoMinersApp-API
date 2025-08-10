@@ -24,7 +24,7 @@ app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
 app.use("/api", statusRoutes);
 app.use("/api/store-miners", storeMinersRoutes);
-app.use("/api/invoices", invoicesRoutes);
+app.use("/api", invoicesRoutes);
 
 // raiz
 app.get("/", (_req, res) => {

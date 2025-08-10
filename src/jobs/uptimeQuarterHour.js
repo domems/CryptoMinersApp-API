@@ -1,10 +1,9 @@
-// src/jobs/uptimeQuarterHour.js
 import cron from "node-cron";
 import { sql } from "../config/db.js";
 import { isMinerOnline } from "../services/minerStatus.js";
 
-// corre de 15 em 15 minutos
 export function startQuarterHourUptime() {
+  // corre de 15 em 15 minutos
   cron.schedule("*/15 * * * *", async () => {
     try {
       const miners = await sql/*sql*/`
@@ -14,17 +13,23 @@ export function startQuarterHourUptime() {
       `;
 
       for (const m of miners) {
-        const online = await isMinerOnline(m).catch(() => false);
+        let online = false;
+        try {
+          online = await isMinerOnline(m);
+        } catch {
+          online = false;
+        }
         if (online) {
           await sql/*sql*/`
             UPDATE miners
-            SET horas_online = COALESCE(horas_online, 0) + 0.25
+            SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
             WHERE id = ${m.id}
           `;
         }
       }
+      console.log("✅ Tick 15m concluído");
     } catch (e) {
-      console.error("⛔ uptime 15m:", e);
+      console.error("⛔ uptimeQuarterHour:", e);
     }
   }, { timezone: "Europe/Lisbon" });
 }

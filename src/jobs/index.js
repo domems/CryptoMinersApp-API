@@ -1,8 +1,7 @@
-// src/jobs/index.js
 import { startQuarterHourUptime } from "./uptimeQuarterHour.js";
-import { startMonthlySnapshot } from "./monthlySnapshot.js";
+import { startMonthlyClose } from "./monthlyClose.js";
 
 export function startAllJobs() {
   startQuarterHourUptime();
-  startMonthlySnapshot();
+  startMonthlyClose();
 }

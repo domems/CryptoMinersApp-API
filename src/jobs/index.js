@@ -1,15 +1,21 @@
-// src/jobs/index.js
-import { startUptimeTracker } from "./uptimeTracker.js";
+import { startUptimeViaBTC } from "./uptimeViaBTC.js";
+import { startUptimeLTCPool } from "./uptimeLiteCoinPool.js";
 
 let started = false;
+
 export function startAllJobs() {
-  if (started) return;
+  if (started) {
+    console.log("[jobs] já iniciado – a ignorar nova chamada.");
+    return;
+  }
   started = true;
 
-  startUptimeTracker();
+  // cada job tem o seu próprio lock por slot
+  startUptimeViaBTC();
+  startUptimeLTCPool();
 
   // (opcional) fecho mensal
   import("./monthlyClose.js")
-    .then(mod => mod?.startMonthlyClose?.())
+    .then((m) => m?.startMonthlyClose?.())
     .catch(() => console.log("[jobs] monthlyClose.js não encontrado (opcional)."));
 }

@@ -34,7 +34,7 @@ function matchWorkerName(apiName, dbName) {
 
 /* ---------- ViaBTC ---------- */
 async function fetchViaBTCList(apiKey, coinRaw) {
-  const coin = String(coinRaw ?? "");
+  const coin = String(coinRaw ?? ""); // usa como está na BD
   const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
   const resp = await fetch(url, { headers: { "X-API-KEY": apiKey } });
   const data = await resp.json().catch(() => null);
@@ -60,6 +60,7 @@ async function fetchLitecoinPoolWorkers(apiKey) {
 export async function runUptimeTickOnce() {
   const slotISO = floorToQuarterISO();
   let totalUpdates = 0;
+  const alreadyUpdated = new Set(); // evita somar duas vezes no mesmo tick
 
   try {
     // 1) miners elegíveis
@@ -91,7 +92,10 @@ export async function runUptimeTickOnce() {
         for (const m of list) {
           const w = workers.find((x) => matchWorkerName(x.worker_name, m.worker_name));
           if (w && (w.worker_status === "active" || w.hashrate_10min > 0)) {
-            onlineIds.push(m.id);
+            if (!alreadyUpdated.has(m.id)) {
+              onlineIds.push(m.id);
+              alreadyUpdated.add(m.id);
+            }
           }
         }
       } else if (pool === "LiteCoinPool") {
@@ -99,7 +103,10 @@ export async function runUptimeTickOnce() {
         for (const m of list) {
           const info = workers?.[m.worker_name];
           if (info && info.connected === true) {
-            onlineIds.push(m.id);
+            if (!alreadyUpdated.has(m.id)) {
+              onlineIds.push(m.id);
+              alreadyUpdated.add(m.id);
+            }
           }
         }
       } else {

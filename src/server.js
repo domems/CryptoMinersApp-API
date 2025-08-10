@@ -11,8 +11,6 @@ import taskRoutes from "./routes/tasks.js";
 
 // NOVO: rotas de faturas
 import invoicesRoutes from "./routes/invoices.js";
-// NOVO: cron jobs (poll uptime + faturação mensal)
-import { startAllJobs } from "./jobs/index.js";
 
 dotenv.config();
 
@@ -123,9 +121,6 @@ async function initDB() {
 
 // arranque
 initDB().then(() => {
-  // inicia cron jobs (poll estado + faturação mensal)
-  startAllJobs();
-
   app.listen(PORT, () => {
     console.log("Server is up and running at port", PORT);
   });

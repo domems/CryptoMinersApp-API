@@ -1,14 +1,10 @@
 import { startQuarterHourUptime } from "./uptimeQuarterHour.js";
-// se também usas o fecho mensal:
-// import { startMonthlyClose } from "./monthlyClose.js";
+import { startMonthlyClose } from "./monthlyClose.js"; // ← agora existe
 
 let started = false;
 
 export function startAllJobs() {
-  if (started) {
-    console.log("[jobs] já iniciado – a ignorar nova chamada.");
-    return;
-  }
+  if (started) return;
   started = true;
 
   startQuarterHourUptime();

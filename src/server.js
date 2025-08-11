@@ -16,6 +16,9 @@ dotenv.config();
 const PORT = process.env.PORT || 5001;
 const app = express();
 
+// ❗ raw body só para o webhook do NOWPayments (antes do express.json)
+app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
+
 // middleware
 app.use(rateLimiter);
 app.use(express.json());

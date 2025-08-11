@@ -24,7 +24,7 @@ router.get("/invoices", async (req, res) => {
       SELECT year, month,
              COALESCE(subtotal_amount,0) AS subtotal_amount,
              COALESCE(status,'pendente') AS status,
-             COALESCE(currency_code,'EUR') AS currency_code
+             COALESCE(currency_code,'USD') AS currency_code
       FROM energy_invoices
       WHERE user_id = ${userId}
       ORDER BY year DESC, month DESC
@@ -35,13 +35,13 @@ router.get("/invoices", async (req, res) => {
       month: Number(r.month),
       subtotal_amount: Number(r.subtotal_amount),
       status: String(r.status),
-      currency_code: String(r.currency_code || "EUR"),
+      currency_code: String(r.currency_code || "USD"),
     }));
 
     if (includeCurrent) {
       const { year, month } = currentYearMonth();
       const [currencyRow] = await sql/*sql*/`
-        SELECT COALESCE(MAX(currency_code),'EUR') AS currency_code
+        SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
@@ -71,7 +71,7 @@ router.get("/invoices", async (req, res) => {
           kwh_used: kwh,
           consumo_kw_hora: consumo,
           preco_kw: preco,
-          amount_eur: amount, // legado
+          amount_eur: amount, // legado: mantém o nome que a UI já consome
         };
       });
 
@@ -82,7 +82,7 @@ router.get("/invoices", async (req, res) => {
         month,
         subtotal_amount: subtotal,
         status: "em_curso",
-        currency_code: String(currencyRow?.currency_code || "EUR"),
+        currency_code: String(currencyRow?.currency_code || "USD"),
       });
     }
 
@@ -110,8 +110,17 @@ router.get("/invoices/detail", async (req, res) => {
     if (isCurrent) {
       const { year: y, month: m } = currentYearMonth();
 
+      // tenta achar fatura já criada (id) para este mês
+      const existing = await sql/*sql*/`
+        SELECT id
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND year = ${y} AND month = ${m}
+        LIMIT 1
+      `;
+      const existingId = existing.length ? Number(existing[0].id) : undefined;
+
       const [currencyRow] = await sql/*sql*/`
-        SELECT COALESCE(MAX(currency_code),'EUR') AS currency_code
+        SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
@@ -141,7 +150,7 @@ router.get("/invoices/detail", async (req, res) => {
           kwh_used: kwh,
           consumo_kw_hora: consumo,
           preco_kw: preco,
-          amount_eur: amount, // legado
+          amount_eur: amount,
         };
       });
 
@@ -150,12 +159,12 @@ router.get("/invoices/detail", async (req, res) => {
 
       return res.json({
         header: {
-          invoice_id: 0, // provisória (sem id persistido)
+          invoice_id: existingId, // se já existe fatura criada para o mês, devolve o id
           year: y,
           month: m,
           status: "em_curso",
           subtotal_amount: subtotal,
-          currency_code: String(currencyRow?.currency_code || "EUR"),
+          currency_code: String(currencyRow?.currency_code || "USD"),
           total_kwh,
         },
         items,
@@ -170,7 +179,7 @@ router.get("/invoices/detail", async (req, res) => {
       SELECT id, year, month,
              COALESCE(subtotal_amount,0) AS subtotal_amount,
              COALESCE(status,'pendente') AS status,
-             COALESCE(currency_code,'EUR') AS currency_code
+             COALESCE(currency_code,'USD') AS currency_code
       FROM energy_invoices
       WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
       LIMIT 1
@@ -198,7 +207,7 @@ router.get("/invoices/detail", async (req, res) => {
         month: Number(inv.month),
         status: String(inv.status),
         subtotal_amount: Number(inv.subtotal_amount),
-        currency_code: String(inv.currency_code || "EUR"),
+        currency_code: String(inv.currency_code || "USD"),
         total_kwh,
       },
       items: items.map((r) => ({
@@ -219,6 +228,7 @@ router.get("/invoices/detail", async (req, res) => {
 
 /**
  * POST /api/invoices/close-now
+ * - fecha a fatura do mês corrente e grava itens
  */
 router.post("/invoices/close-now", async (req, res) => {
   try {
@@ -241,15 +251,17 @@ router.post("/invoices/close-now", async (req, res) => {
 
     let subtotal = 0;
 
+    // cria/garante cabeçalho (default currency_code = 'USD')
     const inserted = await sql/*sql*/`
-      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status)
-      VALUES (${userId}, ${year}, ${month}, 0, 'pendente')
+      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
+      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
       ON CONFLICT (user_id, year, month)
       DO UPDATE SET status = 'pendente'
-      RETURNING id, currency_code
+      RETURNING id
     `;
     const invoiceId = inserted[0].id;
 
+    // grava itens
     for (const r of miners) {
       const hours = Number(r.hours_online) || 0;
       const consumo = Number(r.consumo_kw_hora) || 0;
@@ -273,12 +285,14 @@ router.post("/invoices/close-now", async (req, res) => {
       `;
     }
 
+    // atualiza subtotal
     await sql/*sql*/`
       UPDATE energy_invoices
-      SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente'
+      SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente', currency_code = 'USD'
       WHERE id = ${invoiceId}
     `;
 
+    // reset horas
     await sql/*sql*/`
       UPDATE miners
       SET total_horas_online = 0

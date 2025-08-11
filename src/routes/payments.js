@@ -3,11 +3,8 @@ import { sql } from "../config/db.js";
 import fetch from "node-fetch";
 
 const router = express.Router();
-
-// apenas USDC com redes ERC20, TRC20, SPL
 const NETWORKS = ["ERC20", "TRC20", "SPL"];
 
-// mapeia moeda + rede para código NOWPayments
 function mapCurrency(currency, network) {
   const net = String(network || "").toUpperCase();
   if (currency === "USDC") {
@@ -18,17 +15,17 @@ function mapCurrency(currency, network) {
   throw new Error("Moeda não suportada");
 }
 
-// criar intent de pagamento
+// Criar intent de pagamento
 router.post("/payments/create-intent", async (req, res) => {
   try {
     const { invoiceId, currency, network } = req.body;
-    if (!invoiceId || !currency) {
-      return res.status(400).json({ error: "invoiceId e currency são obrigatórios" });
+    if (!invoiceId || !currency || !network) {
+      return res.status(400).json({ error: "Parâmetros obrigatórios" });
     }
     if (currency !== "USDC") {
-      return res.status(400).json({ error: "Apenas USDC é suportado" });
+      return res.status(400).json({ error: "Apenas USDC suportado" });
     }
-    if (!NETWORKS.includes(String(network || "").toUpperCase())) {
+    if (!NETWORKS.includes(network.toUpperCase())) {
       return res.status(400).json({ error: "Rede inválida" });
     }
 
@@ -41,10 +38,8 @@ router.post("/payments/create-intent", async (req, res) => {
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
     const price_amount = Number(inv.subtotal_amount);
-    const price_currency = "USD"; // sempre USD
     const provider_currency = mapCurrency(currency, network);
 
-    // chamada para NOWPayments
     const nowRes = await fetch("https://api.nowpayments.io/v1/payment", {
       method: "POST",
       headers: {
@@ -53,7 +48,7 @@ router.post("/payments/create-intent", async (req, res) => {
       },
       body: JSON.stringify({
         price_amount,
-        price_currency,
+        price_currency: "USD",
         pay_currency: provider_currency,
         order_id: `invoice_${invoiceId}`,
         order_description: `Fatura energia #${invoiceId}`,
@@ -78,16 +73,78 @@ router.post("/payments/create-intent", async (req, res) => {
       status: "pending",
     };
 
-    // opcional: guardar no DB se quiseres histórico
     await sql`
       INSERT INTO payment_intents(invoice_id, currency, network, amount_fiat, amount_crypto, payment_address, status)
       VALUES (${invoiceId}, ${currency}, ${network}, ${price_amount}, ${nowData.pay_amount}, ${nowData.pay_address}, 'pending')
+      ON CONFLICT (invoice_id) DO UPDATE SET
+        currency = EXCLUDED.currency,
+        network = EXCLUDED.network,
+        amount_fiat = EXCLUDED.amount_fiat,
+        amount_crypto = EXCLUDED.amount_crypto,
+        payment_address = EXCLUDED.payment_address,
+        status = 'pending',
+        updated_at = NOW()
+    `;
+
+    // Atualiza fatura para "aguarda_pagamento"
+    await sql`
+      UPDATE energy_invoices
+      SET status = 'aguarda_pagamento'
+      WHERE id = ${invoiceId}
     `;
 
     res.json({ ok: true, intent });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+// Webhook do NOWPayments
+router.post("/payments/webhook", express.json(), async (req, res) => {
+  try {
+    const payload = req.body;
+    console.log("NOWPayments webhook recebido:", payload);
+
+    // Segurança: valida assinatura se ativada no painel NOWPayments
+    const paymentStatus = String(payload.payment_status || "").toLowerCase();
+    const orderId = String(payload.order_id || "");
+
+    if (!orderId.startsWith("invoice_")) {
+      return res.status(400).json({ error: "Order ID inválido" });
+    }
+
+    const invoiceId = Number(orderId.replace("invoice_", ""));
+    if (!invoiceId) {
+      return res.status(400).json({ error: "Invoice ID inválido" });
+    }
+
+    if (paymentStatus === "finished") {
+      // Marca pagamento como confirmado
+      await sql`
+        UPDATE payment_intents
+        SET status = 'confirmed', txid = ${payload.payment_id || null}, updated_at = NOW()
+        WHERE invoice_id = ${invoiceId}
+      `;
+      await sql`
+        UPDATE energy_invoices
+        SET status = 'pago'
+        WHERE id = ${invoiceId}
+      `;
+      console.log(`✅ Fatura ${invoiceId} marcada como paga`);
+    } else if (paymentStatus === "expired" || paymentStatus === "failed") {
+      await sql`
+        UPDATE payment_intents
+        SET status = 'expired', updated_at = NOW()
+        WHERE invoice_id = ${invoiceId}
+      `;
+      console.log(`⚠️ Pagamento da fatura ${invoiceId} expirou ou falhou`);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Erro no webhook:", err);
+    res.status(500).json({ error: "Erro no processamento do webhook" });
   }
 });
 

@@ -1,3 +1,4 @@
+// src/routes/payments.js
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
@@ -6,34 +7,61 @@ import { sql } from "../config/db.js";
 const router = express.Router();
 
 const NOW_API_KEY = process.env.NOWPAYMENTS_API_KEY;
-const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET; // opcional (HMAC)
-const NOW_IPN_URL = process.env.NOWPAYMENTS_WEBHOOK_URL;   // ex.: https://teu-backend.com/api/payments/webhook
+const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET; // opcional (verificação HMAC)
+const NOW_IPN_URL = process.env.NOWPAYMENTS_WEBHOOK_URL;   // ex: https://teu-backend.com/api/payments/webhook
 const NOW_API = "https://api.nowpayments.io/v1";
 
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
-const USDC_NETWORKS = ["ERC20", "BEP20"]; // (sem SOL)
+const USDC_NETWORKS = ["ERC20", "BEP20"]; // sem SOL neste fluxo
 
 /* =========================
    Utilitários Provider
 ========================= */
 
-// /v1/currencies — pay_currencies disponíveis na tua conta
+// Robust parser: garante que devolve sempre um ARRAY de strings ou lança erro legível
 async function getNowCurrencies() {
   const r = await fetch(`${NOW_API}/currencies`, {
     headers: { "x-api-key": NOW_API_KEY },
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`NOWPayments /currencies falhou: ${r.status} ${t}`);
+
+  const raw = await r.text(); // lê como texto primeiro
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = raw;
   }
-  return r.json(); // ["BTC","LTC","USDC","USDCBSC",...]
+
+  if (!r.ok) {
+    throw new Error(`NOWPayments /currencies falhou: HTTP ${r.status} ${raw}`);
+  }
+
+  // Normaliza para array
+  let list = [];
+  if (Array.isArray(data)) {
+    list = data;
+  } else if (data && Array.isArray(data.currencies)) {
+    list = data.currencies;
+  } else if (data && Array.isArray(data.supported_currencies)) {
+    list = data.supported_currencies;
+  } else {
+    throw new Error(
+      `NOWPayments /currencies formato inesperado: ${typeof data === "string" ? data : JSON.stringify(data)}`
+    );
+  }
+
+  // sanity check
+  if (!Array.isArray(list)) {
+    throw new Error("NOWPayments /currencies não devolveu uma lista de moedas.");
+  }
+  return list.map((s) => String(s).toUpperCase());
 }
 
-// Mapeia moeda + rede -> pay_currency NOWPayments (validado com /currencies)
+// Mapeia moeda+rede → pay_currency do NOWPayments
 async function mapPayCurrency(currency, network) {
   const c = String(currency).toUpperCase();
   const n = String(network || "").toUpperCase();
-  const list = await getNowCurrencies();
+  const list = await getNowCurrencies(); // array robusto
 
   if (c === "USDC") {
     if (!USDC_NETWORKS.includes(n)) throw new Error("Rede inválida para USDC");
@@ -42,6 +70,7 @@ async function mapPayCurrency(currency, network) {
       return "USDC";
     }
     if (n === "BEP20") {
+      // NOWPayments usa "USDCBSC" para BEP-20
       if (!list.includes("USDCBSC")) throw new Error("USDC (BEP20) indisponível no PSP");
       return "USDCBSC";
     }
@@ -59,9 +88,9 @@ async function mapPayCurrency(currency, network) {
   throw new Error("Moeda não suportada");
 }
 
-// (Opcional) verificação assinatura HMAC do IPN
+// (Opcional) verificação HMAC do IPN
 function verifyNowSig(reqBody, headerSig, secret) {
-  if (!secret) return true; // em dev: não bloqueia
+  if (!secret) return true;
   if (!headerSig) return false;
   const raw = JSON.stringify(reqBody);
   const check = crypto.createHmac("sha512", secret).update(raw).digest("hex");
@@ -75,7 +104,7 @@ function verifyNowSig(reqBody, headerSig, secret) {
 /**
  * POST /api/payments/create-intent
  * body: { invoiceId:number, currency:"USDC"|"BTC"|"LTC", network:"ERC20"|"BEP20"|"NATIVE" }
- * -> cria pagamento no NOWPayments e grava TUDO na energy_invoices (sem payment_intents)
+ * -> cria pagamento no NOWPayments e guarda na energy_invoices
  */
 router.post("/payments/create-intent", async (req, res) => {
   try {
@@ -83,6 +112,7 @@ router.post("/payments/create-intent", async (req, res) => {
     if (!invoiceId || !currency) {
       return res.status(400).json({ error: "invoiceId e currency são obrigatórios" });
     }
+
     const cur = String(currency).toUpperCase();
     if (!SUPPORTED_CURRENCIES.includes(cur)) {
       return res.status(400).json({ error: "Moeda inválida" });
@@ -108,6 +138,8 @@ router.post("/payments/create-intent", async (req, res) => {
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
     const price_amount = Number(inv.subtotal_amount);
+
+    // Resolve pay_currency (robusto)
     const pay_currency = await mapPayCurrency(cur, net);
 
     // Cria pagamento no NOWPayments
@@ -120,7 +152,7 @@ router.post("/payments/create-intent", async (req, res) => {
       ...(NOW_IPN_URL ? { ipn_callback_url: NOW_IPN_URL } : {}),
     };
 
-    const nowRes = await fetch(`${NOW_API}/payment`, {
+    const npRes = await fetch(`${NOW_API}/payment`, {
       method: "POST",
       headers: {
         "x-api-key": NOW_API_KEY,
@@ -129,13 +161,20 @@ router.post("/payments/create-intent", async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-    const np = await nowRes.json();
-    if (!nowRes.ok || !np.payment_id) {
-      console.error("NOWPayments error:", np);
+    const raw = await npRes.text();
+    let np;
+    try {
+      np = JSON.parse(raw);
+    } catch {
+      np = raw;
+    }
+
+    if (!npRes.ok || !np?.payment_id) {
+      console.error("NOWPayments error:", raw);
       return res.status(502).json({ error: "Erro na criação do pagamento", provider: np });
     }
 
-    // Guarda diretamente na energy_invoices (sem payment_intents)
+    // Guarda diretamente na energy_invoices
     await sql/*sql*/`
       UPDATE energy_invoices
       SET status               = 'aguarda_pagamento',
@@ -149,8 +188,7 @@ router.post("/payments/create-intent", async (req, res) => {
       WHERE id = ${invoiceId}
     `;
 
-    // Devolve dados que o app precisa
-    return res.json({
+    res.json({
       ok: true,
       intent: {
         invoice_id: invoiceId,
@@ -166,13 +204,12 @@ router.post("/payments/create-intent", async (req, res) => {
     });
   } catch (err) {
     console.error("POST /payments/create-intent:", err);
-    return res.status(500).json({ error: "Erro interno" });
+    res.status(500).json({ error: String(err.message || err) });
   }
 });
 
 /**
  * GET /api/payments/intent?invoiceId=123
- * -> devolve (da energy_invoices) os dados do pagamento para retomar
  */
 router.get("/payments/intent", async (req, res) => {
   try {
@@ -209,7 +246,6 @@ router.get("/payments/intent", async (req, res) => {
 
 /**
  * GET /api/payments/status?invoiceId=123
- * -> estado atual da fatura (alternativa ao /invoices/status)
  */
 router.get("/payments/status", async (req, res) => {
   try {
@@ -233,7 +269,6 @@ router.get("/payments/status", async (req, res) => {
 
 /**
  * GET /api/payments/sync?invoiceId=123
- * -> fallback: consulta o NOWPayments pelo payment_id e atualiza a fatura
  */
 router.get("/payments/sync", async (req, res) => {
   try {
@@ -276,7 +311,6 @@ router.get("/payments/sync", async (req, res) => {
 
 /**
  * POST /api/payments/webhook
- * -> IPN do NOWPayments: atualiza energy_invoices.status com base no payment_id/order_id
  */
 router.post("/payments/webhook", express.json(), async (req, res) => {
   try {
@@ -290,9 +324,7 @@ router.post("/payments/webhook", express.json(), async (req, res) => {
     const paymentId = p.payment_id ? Number(p.payment_id) : null;
 
     let invoiceId = 0;
-    if (orderId.startsWith("invoice_")) {
-      invoiceId = Number(orderId.replace("invoice_", ""));
-    }
+    if (orderId.startsWith("invoice_")) invoiceId = Number(orderId.replace("invoice_", ""));
 
     if (paymentStatus === "finished") {
       if (paymentId) {

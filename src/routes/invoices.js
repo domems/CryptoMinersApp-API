@@ -12,7 +12,7 @@ function currentYearMonth() {
 
 /**
  * GET /api/invoices?userId=...&includeCurrent=1
- * Lista faturas guardadas e, opcionalmente, junta a fatura "em_curso"
+ * Lista faturas guardadas e, opcionalmente, junta a fatura "em_curso" (provisória)
  */
 router.get("/invoices", async (req, res) => {
   try {
@@ -30,7 +30,7 @@ router.get("/invoices", async (req, res) => {
       ORDER BY year DESC, month DESC
     `;
 
-    const rows = saved.map(r => ({
+    const rows = saved.map((r) => ({
       year: Number(r.year),
       month: Number(r.month),
       subtotal_eur: Number(r.subtotal_eur),
@@ -41,7 +41,6 @@ router.get("/invoices", async (req, res) => {
     if (includeCurrent) {
       const { year, month } = currentYearMonth();
 
-      // calcula subtotal a partir das miners do utilizador
       // subtotal = Σ ( total_horas_online * consumo_kw_hora * preco_kw )
       const [agg] = await sql/*sql*/`
         SELECT
@@ -54,7 +53,6 @@ router.get("/invoices", async (req, res) => {
 
       const subtotal = Number(agg?.subtotal || 0);
 
-      // só adiciona se existirem miners (ou se quiseres mostrar mesmo 0 €, mantém)
       rows.unshift({
         year,
         month,
@@ -117,7 +115,12 @@ router.get("/invoices/detail", async (req, res) => {
         };
       });
 
-      const subtotal = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
+      const subtotal = +items
+        .reduce((acc, it) => acc + Number(it.amount_eur || 0), 0)
+        .toFixed(2);
+      const total_kwh = +items
+        .reduce((acc, it) => acc + Number(it.kwh_used || 0), 0)
+        .toFixed(3);
 
       return res.json({
         header: {
@@ -125,6 +128,7 @@ router.get("/invoices/detail", async (req, res) => {
           month: m,
           status: "em_curso",
           subtotal_eur: subtotal,
+          total_kwh,
         },
         items,
       });
@@ -156,12 +160,17 @@ router.get("/invoices/detail", async (req, res) => {
       ORDER BY miner_id ASC
     `;
 
+    const total_kwh = +items
+      .reduce((acc, it) => acc + Number(it.kwh_used || 0), 0)
+      .toFixed(3);
+
     return res.json({
       header: {
         year: Number(inv.year),
         month: Number(inv.month),
         status: String(inv.status),
         subtotal_eur: Number(inv.subtotal_eur),
+        total_kwh,
       },
       items: items.map((r) => ({
         miner_id: r.miner_id,

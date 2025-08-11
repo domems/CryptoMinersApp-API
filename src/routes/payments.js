@@ -1,34 +1,83 @@
 import express from "express";
-import { sql } from "../config/db.js";
 import fetch from "node-fetch";
+import crypto from "crypto";
+import { sql } from "../config/db.js";
 
 const router = express.Router();
 
-const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
-const USDC_NETWORKS = ["ERC20", "BEP20", "SOL"];
+const NOW_API_KEY = process.env.NOWPAYMENTS_API_KEY;
+const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET; // opcional (verificação HMAC)
+const NOW_IPN_URL = process.env.NOWPAYMENTS_WEBHOOK_URL;   // ex: https://teu-backend.com/api/payments/webhook
+const NOW_API = "https://api.nowpayments.io/v1";
 
-/** Mapeia moeda+rede para pay_currency da NOWPayments */
-function mapPayCurrency(currency, network) {
+const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
+// Redes de USDC suportadas no teu fluxo
+const USDC_NETWORKS = ["ERC20", "BEP20"];
+
+/* =========================
+   Utilitários Provider
+========================= */
+
+// GET /v1/currencies — lista pay_currencies disponíveis para a tua conta
+async function getNowCurrencies() {
+  const r = await fetch(`${NOW_API}/currencies`, {
+    headers: { "x-api-key": NOW_API_KEY },
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`NOWPayments /currencies falhou: ${r.status} ${t}`);
+  }
+  return r.json(); // ex.: ["BTC","LTC","USDC","USDCBSC",...]
+}
+
+// Mapeia moeda + rede local → pay_currency do NOWPayments, validando contra /currencies
+async function mapPayCurrency(currency, network) {
   const c = String(currency).toUpperCase();
   const n = String(network || "").toUpperCase();
+  const list = await getNowCurrencies();
 
   if (c === "USDC") {
-    if (!USDC_NETWORKS.includes(n)) {
-      throw new Error("Rede inválida para USDC");
+    if (!USDC_NETWORKS.includes(n)) throw new Error("Rede inválida para USDC");
+    if (n === "ERC20") {
+      if (!list.includes("USDC")) throw new Error("USDC (ERC20) indisponível no PSP");
+      return "USDC";
     }
-    if (n === "ERC20") return "USDC";
-    if (n === "BEP20") return "USDCBSC"; // confirme no painel se é USDCBSC
-    if (n === "SOL") return "USDCSPL";
+    if (n === "BEP20") {
+      // NOWPayments usa "USDCBSC" para BEP-20
+      if (!list.includes("USDCBSC")) throw new Error("USDC (BEP20) indisponível no PSP");
+      return "USDCBSC";
+    }
   }
-  if (c === "BTC") return "BTC";
-  if (c === "LTC") return "LTC";
+
+  if (c === "BTC") {
+    if (!list.includes("BTC")) throw new Error("BTC indisponível no PSP");
+    return "BTC";
+  }
+  if (c === "LTC") {
+    if (!list.includes("LTC")) throw new Error("LTC indisponível no PSP");
+    return "LTC";
+  }
 
   throw new Error("Moeda não suportada");
 }
 
+// (Opcional) verificação da assinatura HMAC do IPN
+function verifyNowSig(reqBody, headerSig, secret) {
+  if (!secret) return true; // em dev, se não tiveres segredo, não bloqueia
+  if (!headerSig) return false;
+  const raw = JSON.stringify(reqBody);
+  const check = crypto.createHmac("sha512", secret).update(raw).digest("hex");
+  return String(headerSig).toLowerCase() === check.toLowerCase();
+}
+
+/* =========================
+   Rotas públicas
+========================= */
+
 /**
  * POST /api/payments/create-intent
- * body: { invoiceId:number, currency:"USDC"|"BTC"|"LTC", network:"ERC20"|"BEP20"|"SOL"|"NATIVE" }
+ * body: { invoiceId:number, currency:"USDC"|"BTC"|"LTC", network:"ERC20"|"BEP20"|"NATIVE" }
+ * -> cria pagamento no NOWPayments e grava TUDO na energy_invoices (sem payment_intents)
  */
 router.post("/payments/create-intent", async (req, res) => {
   try {
@@ -41,17 +90,19 @@ router.post("/payments/create-intent", async (req, res) => {
       return res.status(400).json({ error: "Moeda inválida" });
     }
 
-    // valida rede conforme moeda
+    // Rede por moeda
+    let net = String(network || "").toUpperCase();
     if (cur === "USDC") {
-      if (!USDC_NETWORKS.includes(String(network).toUpperCase())) {
+      if (!USDC_NETWORKS.includes(net)) {
         return res.status(400).json({ error: "Rede inválida para USDC" });
       }
     } else {
-      // BTC/LTC ignoram network (nativo)
+      net = "NATIVE"; // BTC/LTC usam rede base
     }
 
+    // Lê a fatura
     const [inv] = await sql/*sql*/`
-      SELECT id, subtotal_amount
+      SELECT id, subtotal_amount, status
       FROM energy_invoices
       WHERE id = ${invoiceId}
       LIMIT 1
@@ -59,132 +110,227 @@ router.post("/payments/create-intent", async (req, res) => {
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
     const price_amount = Number(inv.subtotal_amount);
-    const pay_currency = mapPayCurrency(cur, network);
+    const pay_currency = await mapPayCurrency(cur, net);
 
-    // Criação do pagamento na NOWPayments
-    const nowRes = await fetch("https://api.nowpayments.io/v1/payment", {
+    // Cria pagamento no NOWPayments
+    const payload = {
+      price_amount,
+      price_currency: "USD",
+      pay_currency,
+      order_id: `invoice_${invoiceId}`,
+      order_description: `Energia #${invoiceId}`,
+    };
+    if (NOW_IPN_URL) payload.ipn_callback_url = NOW_IPN_URL;
+
+    const nowRes = await fetch(`${NOW_API}/payment`, {
       method: "POST",
       headers: {
-        "x-api-key": process.env.NOWPAYMENTS_API_KEY,
+        "x-api-key": NOW_API_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        price_amount,
-        price_currency: "USD",
-        pay_currency,
-        order_id: `invoice_${invoiceId}`,
-        order_description: `Energia #${invoiceId}`,
-      }),
+      body: JSON.stringify(payload),
     });
 
-    if (!nowRes.ok) {
-      const errTxt = await nowRes.text();
-      console.error("NOWPayments error:", errTxt);
-      return res.status(502).json({ error: "Erro na criação do pagamento" });
-    }
     const np = await nowRes.json();
+    if (!nowRes.ok || !np.payment_id) {
+      console.error("NOWPayments error:", np);
+      return res.status(502).json({ error: "Erro na criação do pagamento", provider: np });
+    }
 
-    // Guarda/atualiza intent e devolve o id
-    const rows = await sql/*sql*/`
-      INSERT INTO payment_intents (invoice_id, currency, network, provider_currency, amount_fiat, amount_crypto, payment_address, status, pay_url)
-      VALUES (
-        ${invoiceId},
-        ${cur},
-        ${cur === "USDC" ? String(network).toUpperCase() : "NATIVE"},
-        ${pay_currency},
-        ${price_amount},
-        ${Number(np.pay_amount || 0)},
-        ${np.pay_address || null},
-        'pending',
-        ${np.invoice_url || null}
-      )
-      ON CONFLICT (invoice_id) DO UPDATE SET
-        currency = EXCLUDED.currency,
-        network = EXCLUDED.network,
-        provider_currency = EXCLUDED.provider_currency,
-        amount_fiat = EXCLUDED.amount_fiat,
-        amount_crypto = EXCLUDED.amount_crypto,
-        payment_address = EXCLUDED.payment_address,
-        status = 'pending',
-        pay_url = EXCLUDED.pay_url,
-        updated_at = NOW()
-      RETURNING id, invoice_id, currency, network, provider_currency, amount_fiat, amount_crypto, payment_address, status, pay_url, created_at, updated_at
-    `;
-    const intent = rows[0];
-
-    // fatura passa a "aguarda_pagamento"
+    // Guarda diretamente na energy_invoices (sem payment_intents)
     await sql/*sql*/`
-      UPDATE energy_invoices SET status = 'aguarda_pagamento' WHERE id = ${invoiceId}
+      UPDATE energy_invoices
+      SET status               = 'aguarda_pagamento',
+          provider_payment_id  = ${Number(np.payment_id)},
+          provider_currency    = ${pay_currency},
+          pay_network          = ${net},
+          pay_address          = ${np.pay_address || null},
+          pay_amount           = ${np.pay_amount || null},
+          pay_url              = ${np.invoice_url || null},
+          updated_at           = NOW()
+      WHERE id = ${invoiceId}
     `;
 
-    res.json({ ok: true, intent });
+    // Devolve um "intent" sintético (o app só precisa destes dados)
+    return res.json({
+      ok: true,
+      intent: {
+        invoice_id: invoiceId,
+        currency: cur,
+        network: net,
+        provider_currency: pay_currency,
+        amount_fiat: price_amount,
+        amount_crypto: np.pay_amount || null,
+        payment_address: np.pay_address || null,
+        pay_url: np.invoice_url || null,
+        status: "pending",
+      },
+    });
   } catch (err) {
     console.error("POST /payments/create-intent:", err);
-    res.status(500).json({ error: "Erro interno" });
+    return res.status(500).json({ error: "Erro interno" });
   }
 });
 
 /**
- * GET /api/payments/:id
- * devolve o intent (para o polling do app)
+ * GET /api/payments/intent?invoiceId=123
+ * -> devolve os dados do intent guardados na energy_invoices (para renderizar/retomar)
  */
-router.get("/payments/:id", async (req, res) => {
+router.get("/payments/intent", async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ error: "id inválido" });
+    const invoiceId = Number(req.query.invoiceId);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
 
-    const rows = await sql/*sql*/`
-      SELECT id, invoice_id, currency, network, provider_currency, amount_fiat, amount_crypto, payment_address, status, pay_url, created_at, updated_at
-      FROM payment_intents
-      WHERE id = ${id}
+    const [inv] = await sql/*sql*/`
+      SELECT id, status, provider_payment_id, provider_currency, pay_network, pay_address, pay_amount, pay_url, subtotal_amount
+      FROM energy_invoices
+      WHERE id = ${invoiceId}
       LIMIT 1
     `;
-    if (!rows.length) return res.status(404).json({ error: "Intent não encontrado" });
+    if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
-    res.json({ ok: true, intent: rows[0] });
+    res.json({
+      ok: true,
+      intent: {
+        invoice_id: inv.id,
+        status: inv.status,
+        provider_payment_id: inv.provider_payment_id,
+        provider_currency: inv.provider_currency,
+        network: inv.pay_network,
+        payment_address: inv.pay_address,
+        amount_crypto: inv.pay_amount,
+        amount_fiat: inv.subtotal_amount,
+        pay_url: inv.pay_url,
+      },
+    });
   } catch (err) {
-    console.error("GET /payments/:id:", err);
+    console.error("GET /payments/intent:", err);
     res.status(500).json({ error: "Erro interno" });
   }
 });
 
 /**
- * Webhook NOWPayments
+ * GET /api/payments/status?invoiceId=123
+ * -> estado atual da fatura (para polling no app)
+ */
+router.get("/payments/status", async (req, res) => {
+  try {
+    const invoiceId = Number(req.query.invoiceId);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
+
+    const [inv] = await sql/*sql*/`
+      SELECT status
+      FROM energy_invoices
+      WHERE id = ${invoiceId}
+      LIMIT 1
+    `;
+    if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
+
+    res.json({ ok: true, status: inv.status });
+  } catch (err) {
+    console.error("GET /payments/status:", err);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+/**
+ * GET /api/payments/sync?invoiceId=123
+ * -> fallback: consulta o NOWPayments pelo payment_id e atualiza a fatura
+ */
+router.get("/payments/sync", async (req, res) => {
+  try {
+    const invoiceId = Number(req.query.invoiceId);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
+
+    const [row] = await sql/*sql*/`
+      SELECT provider_payment_id
+      FROM energy_invoices
+      WHERE id = ${invoiceId}
+      LIMIT 1
+    `;
+    if (!row?.provider_payment_id) {
+      return res.status(400).json({ error: "sem provider_payment_id na fatura" });
+    }
+
+    const r = await fetch(`${NOW_API}/payment/${row.provider_payment_id}`, {
+      headers: { "x-api-key": NOW_API_KEY },
+    });
+    const p = await r.json();
+    if (!r.ok) {
+      return res.status(502).json({ error: "Erro no provider", detail: p });
+    }
+
+    const status = String(p.payment_status || "").toLowerCase();
+    if (status === "finished") {
+      await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+    } else if (status === "failed" || status === "expired") {
+      await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
+    } else if (status === "partially_paid") {
+      await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
+    }
+
+    res.json({ ok: true, provider_status: status });
+  } catch (err) {
+    console.error("GET /payments/sync:", err);
+    res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+/**
+ * POST /api/payments/webhook
+ * -> IPN do NOWPayments: atualiza energy_invoices.status com base no payment_id
  */
 router.post("/payments/webhook", express.json(), async (req, res) => {
   try {
-    const payload = req.body;
-    const paymentStatus = String(payload.payment_status || "").toLowerCase();
-    const orderId = String(payload.order_id || "");
-
-    if (!orderId.startsWith("invoice_")) {
-      return res.status(400).json({ error: "Order ID inválido" });
+    if (!verifyNowSig(req.body, req.headers["x-nowpayments-sig"], NOW_IPN_SECRET)) {
+      return res.status(401).json({ error: "assinatura inválida" });
     }
-    const invoiceId = Number(orderId.replace("invoice_", ""));
-    if (!invoiceId) return res.status(400).json({ error: "Invoice ID inválido" });
+
+    const p = req.body;
+    const paymentStatus = String(p.payment_status || "").toLowerCase();
+    const orderId = String(p.order_id || "");
+    const paymentId = p.payment_id ? Number(p.payment_id) : null;
+
+    // Podes usar tanto order_id (invoice_123) como payment_id. Usaremos ambos para robustez.
+    let invoiceId = 0;
+    if (orderId.startsWith("invoice_")) {
+      invoiceId = Number(orderId.replace("invoice_", ""));
+    }
 
     if (paymentStatus === "finished") {
-      await sql/*sql*/`
-        UPDATE payment_intents
-        SET status = 'confirmed', txid = ${payload.payment_id || null}, updated_at = NOW()
-        WHERE invoice_id = ${invoiceId}
-      `;
-      await sql/*sql*/`
-        UPDATE energy_invoices
-        SET status = 'pago'
-        WHERE id = ${invoiceId}
-      `;
-    } else if (paymentStatus === "expired" || paymentStatus === "failed") {
-      await sql/*sql*/`
-        UPDATE payment_intents
-        SET status = 'expired', updated_at = NOW()
-        WHERE invoice_id = ${invoiceId}
-      `;
+      if (paymentId) {
+        await sql/*sql*/`
+          UPDATE energy_invoices
+          SET status='pago'
+          WHERE provider_payment_id=${paymentId}
+             OR (id=${invoiceId} AND ${invoiceId} <> 0)
+        `;
+      } else if (invoiceId) {
+        await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+      }
+    } else if (paymentStatus === "partially_paid") {
+      if (paymentId) {
+        await sql/*sql*/`
+          UPDATE energy_invoices
+          SET status='aguarda_pagamento'
+          WHERE provider_payment_id=${paymentId}
+             OR (id=${invoiceId} AND ${invoiceId} <> 0)
+        `;
+      }
+    } else if (paymentStatus === "failed" || paymentStatus === "expired") {
+      if (paymentId) {
+        await sql/*sql*/`
+          UPDATE energy_invoices
+          SET status='pendente'
+          WHERE provider_payment_id=${paymentId}
+             OR (id=${invoiceId} AND ${invoiceId} <> 0)
+        `;
+      }
     }
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("Webhook NOWPayments:", err);
+    console.error("POST /payments/webhook:", err);
     res.status(500).json({ error: "Erro no processamento do webhook" });
   }
 });

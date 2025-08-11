@@ -9,6 +9,7 @@ import statusRoutes from "./routes/statusRoutes.js";
 import storeMinersRoutes from "./routes/storeMiners.js";
 import { startAllJobs } from "./jobs/index.js";
 import invoicesRoutes from "./routes/invoices.js";
+import paymentsRoutes from "./routes/payments.js";
 
 dotenv.config();
 
@@ -25,6 +26,7 @@ app.use("/api/miners", minerRoutes);
 app.use("/api", statusRoutes);
 app.use("/api/store-miners", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
+app.use("/api", paymentsRoutes);
 
 // raiz
 app.get("/", (_req, res) => {

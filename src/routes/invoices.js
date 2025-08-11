@@ -188,4 +188,96 @@ router.get("/invoices/detail", async (req, res) => {
   }
 });
 
+/**
+ * POST /api/invoices/close-now
+ * Fecha a fatura do MÊS CORRENTE para o userId:
+ * - cria/atualiza cabeçalho em energy_invoices (status 'pendente')
+ * - grava itens em energy_invoice_items (horas, kWh, €)
+ * - faz reset a miners.total_horas_online
+ *
+ * body: { userId: string }
+ */
+router.post("/invoices/close-now", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "");
+    if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+    const { year, month } = currentYearMonth();
+
+    // Busca miners do utilizador
+    const miners = await sql/*sql*/`
+      SELECT
+        id,
+        COALESCE(nome, CONCAT('Miner#', id::text))   AS miner_nome,
+        COALESCE(total_horas_online,0)               AS hours_online,
+        COALESCE(consumo_kw_hora,0)                  AS consumo_kw_hora,
+        COALESCE(preco_kw,0)                         AS preco_kw
+      FROM miners
+      WHERE user_id = ${userId}
+      ORDER BY id ASC
+    `;
+
+    // Se não há miners, ainda assim criamos a fatura para uniformidade (total 0)
+    let subtotal = 0;
+
+    // Upsert do cabeçalho (garante 1 por ano/mês/user)
+    const inserted = await sql/*sql*/`
+      INSERT INTO energy_invoices (user_id, year, month, subtotal_eur, status)
+      VALUES (${userId}, ${year}, ${month}, 0, 'pendente')
+      ON CONFLICT (user_id, year, month)
+      DO UPDATE SET status = 'pendente'
+      RETURNING id
+    `;
+    const invoiceId = inserted[0].id;
+
+    // Grava/atualiza itens
+    for (const r of miners) {
+      const hours = Number(r.hours_online) || 0;
+      const consumo = Number(r.consumo_kw_hora) || 0;
+      const preco = Number(r.preco_kw) || 0;
+      const kwh = +(hours * consumo).toFixed(3);
+      const amount = +(kwh * preco).toFixed(2);
+      subtotal += amount;
+
+      await sql/*sql*/`
+        INSERT INTO energy_invoice_items
+          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
+        VALUES
+          (${invoiceId}, ${r.id}, ${r.miner_nome}, ${hours}, ${kwh}, ${preco}, ${consumo}, ${amount})
+        ON CONFLICT (invoice_id, miner_id) DO UPDATE SET
+          miner_nome        = EXCLUDED.miner_nome,
+          hours_online      = EXCLUDED.hours_online,
+          kwh_used          = EXCLUDED.kwh_used,
+          preco_kw          = EXCLUDED.preco_kw,
+          consumo_kw_hora   = EXCLUDED.consumo_kw_hora,
+          amount_eur        = EXCLUDED.amount_eur
+      `;
+    }
+
+    // Atualiza subtotal e deixa status 'pendente' (à espera de pagamento)
+    await sql/*sql*/`
+      UPDATE energy_invoices
+      SET subtotal_eur = ${+subtotal.toFixed(2)}, status = 'pendente'
+      WHERE id = ${invoiceId}
+    `;
+
+    // Reset do contador de horas para começar novo ciclo
+    await sql/*sql*/`
+      UPDATE miners
+      SET total_horas_online = 0
+      WHERE user_id = ${userId}
+    `;
+
+    // (Opcional) devolver payload que a UI já entende
+    return res.json({
+      ok: true,
+      invoice: { id: invoiceId, year, month, status: "pendente", subtotal_eur: +subtotal.toFixed(2) }
+    });
+  } catch (e) {
+    console.error("POST /invoices/close-now:", e);
+    return res.status(500).json({ error: "Erro ao fechar fatura" });
+  }
+});
+
+
 export default router;

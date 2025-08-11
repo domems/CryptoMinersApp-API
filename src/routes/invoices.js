@@ -1,18 +1,16 @@
-// src/routes/invoices.js
 import express from "express";
 import { sql } from "../config/db.js";
 
 const router = express.Router();
 
-/** helpers de datas (hora local do servidor; o cron mensal já usa Europe/Lisbon) */
+/** helpers de datas */
 function currentYearMonth() {
   const now = new Date();
-  return { year: now.getFullYear(), month: now.getMonth() + 1 }; // 1..12
+  return { year: now.getFullYear(), month: now.getMonth() + 1 };
 }
 
 /**
  * GET /api/invoices?userId=...&includeCurrent=1
- * Lista faturas guardadas e, opcionalmente, junta a fatura "em_curso" (provisória)
  */
 router.get("/invoices", async (req, res) => {
   try {
@@ -71,7 +69,7 @@ router.get("/invoices", async (req, res) => {
           kwh_used: kwh,
           consumo_kw_hora: consumo,
           preco_kw: preco,
-          amount_eur: amount, // legado: mantém o nome que a UI já consome
+          amount_eur: amount, // legado
         };
       });
 
@@ -95,8 +93,8 @@ router.get("/invoices", async (req, res) => {
 
 /**
  * GET /api/invoices/detail
- * - Fatura em curso:  /api/invoices/detail?userId=...&current=1
- * - Fatura fechada:   /api/invoices/detail?userId=...&year=2025&month=7
+ * - em curso:   /api/invoices/detail?userId=...&current=1
+ * - fechada:    /api/invoices/detail?userId=...&year=YYYY&month=M
  */
 router.get("/invoices/detail", async (req, res) => {
   try {
@@ -110,7 +108,6 @@ router.get("/invoices/detail", async (req, res) => {
     if (isCurrent) {
       const { year: y, month: m } = currentYearMonth();
 
-      // tenta achar fatura já criada (id) para este mês
       const existing = await sql/*sql*/`
         SELECT id
         FROM energy_invoices
@@ -159,7 +156,7 @@ router.get("/invoices/detail", async (req, res) => {
 
       return res.json({
         header: {
-          invoice_id: existingId, // se já existe fatura criada para o mês, devolve o id
+          invoice_id: existingId, // pode vir undefined quando ainda não fechaste
           year: y,
           month: m,
           status: "em_curso",
@@ -228,7 +225,6 @@ router.get("/invoices/detail", async (req, res) => {
 
 /**
  * POST /api/invoices/close-now
- * - fecha a fatura do mês corrente e grava itens
  */
 router.post("/invoices/close-now", async (req, res) => {
   try {
@@ -251,7 +247,6 @@ router.post("/invoices/close-now", async (req, res) => {
 
     let subtotal = 0;
 
-    // cria/garante cabeçalho (default currency_code = 'USD')
     const inserted = await sql/*sql*/`
       INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
       VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
@@ -261,7 +256,6 @@ router.post("/invoices/close-now", async (req, res) => {
     `;
     const invoiceId = inserted[0].id;
 
-    // grava itens
     for (const r of miners) {
       const hours = Number(r.hours_online) || 0;
       const consumo = Number(r.consumo_kw_hora) || 0;
@@ -285,14 +279,12 @@ router.post("/invoices/close-now", async (req, res) => {
       `;
     }
 
-    // atualiza subtotal
     await sql/*sql*/`
       UPDATE energy_invoices
       SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente', currency_code = 'USD'
       WHERE id = ${invoiceId}
     `;
 
-    // reset horas
     await sql/*sql*/`
       UPDATE miners
       SET total_horas_online = 0

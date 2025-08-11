@@ -301,4 +301,31 @@ router.post("/invoices/close-now", async (req, res) => {
   }
 });
 
+/**
+ * GET /api/invoices/status?invoiceId=123
+ * -> usado pelo app para polling direto do estado da fatura
+ */
+router.get("/invoices/status", async (req, res) => {
+  try {
+    const invoiceId = Number(req.query.invoiceId);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
+
+    const [inv] = await sql/*sql*/`
+      SELECT id, status, subtotal_amount
+      FROM energy_invoices
+      WHERE id = ${invoiceId}
+      LIMIT 1
+    `;
+    if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
+
+    res.json({
+      ok: true,
+      invoice: { id: Number(inv.id), status: String(inv.status), subtotal_amount: Number(inv.subtotal_amount) }
+    });
+  } catch (e) {
+    console.error("GET /invoices/status:", e);
+    res.status(500).json({ error: "Erro ao consultar estado da fatura" });
+  }
+});
+
 export default router;

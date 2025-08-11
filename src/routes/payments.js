@@ -6,19 +6,18 @@ import { sql } from "../config/db.js";
 const router = express.Router();
 
 const NOW_API_KEY = process.env.NOWPAYMENTS_API_KEY;
-const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET; // opcional (verificação HMAC)
-const NOW_IPN_URL = process.env.NOWPAYMENTS_WEBHOOK_URL;   // ex: https://teu-backend.com/api/payments/webhook
+const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET; // opcional (HMAC)
+const NOW_IPN_URL = process.env.NOWPAYMENTS_WEBHOOK_URL;   // ex.: https://teu-backend.com/api/payments/webhook
 const NOW_API = "https://api.nowpayments.io/v1";
 
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
-// Redes de USDC suportadas no teu fluxo
-const USDC_NETWORKS = ["ERC20", "BEP20"];
+const USDC_NETWORKS = ["ERC20", "BEP20"]; // (sem SOL)
 
 /* =========================
    Utilitários Provider
 ========================= */
 
-// GET /v1/currencies — lista pay_currencies disponíveis para a tua conta
+// /v1/currencies — pay_currencies disponíveis na tua conta
 async function getNowCurrencies() {
   const r = await fetch(`${NOW_API}/currencies`, {
     headers: { "x-api-key": NOW_API_KEY },
@@ -27,10 +26,10 @@ async function getNowCurrencies() {
     const t = await r.text().catch(() => "");
     throw new Error(`NOWPayments /currencies falhou: ${r.status} ${t}`);
   }
-  return r.json(); // ex.: ["BTC","LTC","USDC","USDCBSC",...]
+  return r.json(); // ["BTC","LTC","USDC","USDCBSC",...]
 }
 
-// Mapeia moeda + rede local → pay_currency do NOWPayments, validando contra /currencies
+// Mapeia moeda + rede -> pay_currency NOWPayments (validado com /currencies)
 async function mapPayCurrency(currency, network) {
   const c = String(currency).toUpperCase();
   const n = String(network || "").toUpperCase();
@@ -43,7 +42,6 @@ async function mapPayCurrency(currency, network) {
       return "USDC";
     }
     if (n === "BEP20") {
-      // NOWPayments usa "USDCBSC" para BEP-20
       if (!list.includes("USDCBSC")) throw new Error("USDC (BEP20) indisponível no PSP");
       return "USDCBSC";
     }
@@ -61,9 +59,9 @@ async function mapPayCurrency(currency, network) {
   throw new Error("Moeda não suportada");
 }
 
-// (Opcional) verificação da assinatura HMAC do IPN
+// (Opcional) verificação assinatura HMAC do IPN
 function verifyNowSig(reqBody, headerSig, secret) {
-  if (!secret) return true; // em dev, se não tiveres segredo, não bloqueia
+  if (!secret) return true; // em dev: não bloqueia
   if (!headerSig) return false;
   const raw = JSON.stringify(reqBody);
   const check = crypto.createHmac("sha512", secret).update(raw).digest("hex");
@@ -71,7 +69,7 @@ function verifyNowSig(reqBody, headerSig, secret) {
 }
 
 /* =========================
-   Rotas públicas
+   Rotas
 ========================= */
 
 /**
@@ -97,7 +95,7 @@ router.post("/payments/create-intent", async (req, res) => {
         return res.status(400).json({ error: "Rede inválida para USDC" });
       }
     } else {
-      net = "NATIVE"; // BTC/LTC usam rede base
+      net = "NATIVE"; // BTC/LTC rede base
     }
 
     // Lê a fatura
@@ -119,8 +117,8 @@ router.post("/payments/create-intent", async (req, res) => {
       pay_currency,
       order_id: `invoice_${invoiceId}`,
       order_description: `Energia #${invoiceId}`,
+      ...(NOW_IPN_URL ? { ipn_callback_url: NOW_IPN_URL } : {}),
     };
-    if (NOW_IPN_URL) payload.ipn_callback_url = NOW_IPN_URL;
 
     const nowRes = await fetch(`${NOW_API}/payment`, {
       method: "POST",
@@ -151,7 +149,7 @@ router.post("/payments/create-intent", async (req, res) => {
       WHERE id = ${invoiceId}
     `;
 
-    // Devolve um "intent" sintético (o app só precisa destes dados)
+    // Devolve dados que o app precisa
     return res.json({
       ok: true,
       intent: {
@@ -174,7 +172,7 @@ router.post("/payments/create-intent", async (req, res) => {
 
 /**
  * GET /api/payments/intent?invoiceId=123
- * -> devolve os dados do intent guardados na energy_invoices (para renderizar/retomar)
+ * -> devolve (da energy_invoices) os dados do pagamento para retomar
  */
 router.get("/payments/intent", async (req, res) => {
   try {
@@ -211,7 +209,7 @@ router.get("/payments/intent", async (req, res) => {
 
 /**
  * GET /api/payments/status?invoiceId=123
- * -> estado atual da fatura (para polling no app)
+ * -> estado atual da fatura (alternativa ao /invoices/status)
  */
 router.get("/payments/status", async (req, res) => {
   try {
@@ -278,7 +276,7 @@ router.get("/payments/sync", async (req, res) => {
 
 /**
  * POST /api/payments/webhook
- * -> IPN do NOWPayments: atualiza energy_invoices.status com base no payment_id
+ * -> IPN do NOWPayments: atualiza energy_invoices.status com base no payment_id/order_id
  */
 router.post("/payments/webhook", express.json(), async (req, res) => {
   try {
@@ -291,7 +289,6 @@ router.post("/payments/webhook", express.json(), async (req, res) => {
     const orderId = String(p.order_id || "");
     const paymentId = p.payment_id ? Number(p.payment_id) : null;
 
-    // Podes usar tanto order_id (invoice_123) como payment_id. Usaremos ambos para robustez.
     let invoiceId = 0;
     if (orderId.startsWith("invoice_")) {
       invoiceId = Number(orderId.replace("invoice_", ""));

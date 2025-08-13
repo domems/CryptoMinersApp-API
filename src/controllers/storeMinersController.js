@@ -198,84 +198,148 @@ export async function deleteStoreMiner(req, res) {
   }
 }
 
+
+// util
+const normalizeDecimal = (v) =>
+  v === null || v === undefined || v === "" ? null : Number(String(v).trim().replace(/\s+/g, "").replace(/\./g, "").replace(",", "."));
+
+function generateWorkerList(input, qty) {
+  const trimmed = String(input || "").trim();
+  qty = Math.max(1, Number(qty) || 1);
+  if (!trimmed) return Array.from({ length: qty }, () => null);
+
+  const hasDot = trimmed.includes(".");
+  const isDigitsOnly = /^[0-9]+$/.test(trimmed);
+
+  if (!hasDot && isDigitsOnly) {
+    const width = trimmed.length;
+    const start = parseInt(trimmed, 10);
+    return Array.from({ length: qty }, (_, i) => String(start + i).padStart(width, "0"));
+  }
+
+  if (hasDot) {
+    const [acc, suffix = ""] = trimmed.split(".", 2);
+    const numericSuffix = /^[0-9]+$/.test(suffix);
+    if (numericSuffix) {
+      const width = suffix.length;
+      const start = parseInt(suffix, 10);
+      return Array.from({ length: qty }, (_, i) => `${acc}.${String(start + i).padStart(width, "0")}`);
+    }
+    if (qty === 1) return [trimmed];
+    return Array.from({ length: qty }, (_, i) => `${trimmed}.${String(i + 1).padStart(3, "0")}`);
+  }
+
+  return Array.from({ length: qty }, (_, i) => `${trimmed}.${String(i + 1).padStart(3, "0")}`);
+}
+
 // POST /api/store-miners/:id/assign
 export async function assignStoreMinerToUser(req, res) {
   try {
     const { id } = req.params;
-    const { email, worker_name, preco_kw, pool } = req.body;
+    const {
+      email,
+      quantity = 1,
+      worker_pattern,         // ex: "acc.001", "acc", "001" (gera lista server-side)
+      nome,                   // overrides opcionais
+      modelo,
+      hash_rate,
+      consumo_kw_hora,
+      preco_kw,
+      coin,
+      pool,
+      api_key,
+    } = req.body;
 
     if (!email || !email.trim()) {
       return res.status(400).json({ error: "Email é obrigatório." });
     }
-    const emailNorm = email.trim();
 
-    // 1) Resolver user_id via Clerk
-    let userId;
+    // 1) Resolve user_id via Clerk
+    let user_id;
     try {
-      userId = await resolveUserIdByEmail(emailNorm);
+      user_id = await resolveUserIdByEmail(email.trim());
     } catch (e) {
-      // Mapeamento de erros da Clerk para HTTP do teu backend
-      if (e.status === 404) {
-        return res.status(404).json({ error: "Utilizador não encontrado (Clerk)." });
-      }
-      if (e.status === 401 || e.status === 403) {
-        return res
-          .status(502)
-          .json({ error: "Falha na verificação com a Clerk (credenciais inválidas)." });
-      }
-      return res.status(502).json({ error: e.message || "Erro na Clerk API." });
+      const msg =
+        e.status === 404
+          ? "Utilizador não encontrado (Clerk)."
+          : e.status === 401 || e.status === 403
+          ? "Falha na verificação com a Clerk (credenciais)."
+          : e.message || "Erro na Clerk API.";
+      return res.status(e.status && e.status !== 200 ? e.status : 502).json({ error: msg });
     }
 
-    // 2) Buscar a máquina da loja
+    // 2) Buscar máquina da loja
     const [sm] = await sql`SELECT * FROM store_miners WHERE id = ${id} LIMIT 1;`;
     if (!sm) return res.status(404).json({ error: "Máquina da loja não encontrada." });
 
-    // 3) Evitar duplicados: mesmo user + modelo + coin + worker_name (NULL = NULL)
-    const [dup] = await sql`
-      SELECT id FROM miners
-      WHERE user_id = ${userId}
-        AND modelo   = ${sm.modelo}
-        AND coin     = ${sm.coin}
-        AND (worker_name IS NOT DISTINCT FROM ${worker_name || null})
-      LIMIT 1
-    `;
-    if (dup) {
-      return res
-        .status(409)
-        .json({ error: "Este utilizador já tem uma mineradora igual (modelo/coin/worker)." });
+    // 3) Defaults a partir da loja + overrides do body
+    const baseNome   = (nome ?? sm.nome) || "Miner";
+    const useModelo  = (modelo ?? sm.modelo) || null;
+    const useHash    = (hash_rate ?? sm.hash_rate) || null;    // tua coluna é text
+    const useConsumo = normalizeDecimal(consumo_kw_hora ?? sm.consumo_kw);
+    const usePreco   = normalizeDecimal(preco_kw);
+    const useCoin    = (coin || sm.coin || null);
+    const usePool    = pool || null;
+    const useApiKey  = api_key || null;
+
+    const qty = Math.max(1, Number(quantity) || 1);
+    const workers = generateWorkerList(worker_pattern, qty);
+
+    let created = 0;
+    const failed = []; // { index, reason }
+
+    for (let i = 0; i < qty; i++) {
+      const worker_name = workers[i];
+      const nomeSeq = `${baseNome}${qty > 1 ? ` #${String(i + 1).padStart(2, "0")}` : ""}`;
+
+      try {
+        // Duplicados só se houver worker_name (se for null, permitimos múltiplos iguais)
+        if (worker_name) {
+          const [dup] = await sql`
+            SELECT 1 FROM miners
+            WHERE user_id = ${user_id}
+              AND modelo   = ${useModelo}
+              AND coin     = ${useCoin}
+              AND worker_name = ${worker_name}
+            LIMIT 1
+          `;
+          if (dup) {
+            failed.push({ index: i, reason: "duplicate" });
+            continue;
+          }
+        }
+
+        await sql`
+          INSERT INTO miners (
+            user_id, nome, modelo, hash_rate, worker_name, status,
+            preco_kw, consumo_kw_hora, created_at, total_horas_online,
+            api_key, secret_key, coin, pool
+          ) VALUES (
+            ${user_id},
+            ${nomeSeq}, ${useModelo}, ${useHash},
+            ${worker_name || null},
+            'offline',
+            ${usePreco},
+            ${useConsumo},
+            NOW(),
+            0,
+            ${useApiKey}, NULL,
+            ${useCoin},
+            ${usePool}
+          )
+        `;
+        created++;
+      } catch (e) {
+        console.error("assign/insert error:", e);
+        failed.push({ index: i, reason: "db_error" });
+      }
     }
 
-    // 4) Normalizar número opcional (preço kWh)
-    const normalizeNumber = (v) =>
-      v === null || v === undefined || v === "" ? null : Number(String(v).replace(",", "."));
-    const precoKwNum = normalizeNumber(preco_kw);
-
-    // 5) Inserir em miners (status offline por omissão)
-    const [row] = await sql`
-      INSERT INTO miners (
-        user_id, nome, modelo, hash_rate, worker_name, status,
-        preco_kw, consumo_kw_hora, created_at, total_horas_online,
-        api_key, secret_key, coin, pool
-      ) VALUES (
-        ${userId},
-        ${sm.nome}, ${sm.modelo}, ${sm.hash_rate},
-        ${worker_name || null},
-        'offline',
-        ${precoKwNum},
-        ${sm.consumo_kw},
-        NOW(),
-        0,
-        NULL, NULL,
-        ${sm.coin},
-        ${pool || null}
-      )
-      RETURNING *;
-    `;
-
-    return res.status(201).json(row);
+    return res.status(created > 0 ? 201 : 400).json({ created, failed, total: qty });
   } catch (err) {
     console.error("Erro ao atribuir máquina ao utilizador:", err);
     return res.status(500).json({ error: "Erro ao atribuir máquina ao utilizador." });
   }
 }
+
 

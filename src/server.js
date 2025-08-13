@@ -29,7 +29,7 @@ app.use(express.json());
 app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
 app.use("/api", statusRoutes);
-app.use("/api/store-miners", storeMinersRoutes);
+app.use("/api", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
 app.use("/api/admin", minersAdminRoutes);

@@ -3,37 +3,65 @@ import { sql } from "../config/db.js";
 import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
 /** Constrói WHERE dinâmico de forma segura */
-function buildWhere({ q, coin, exibicao }) {
+// helpers no topo (antes das funções)
+function parseBool(v) {
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "t", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "f", "no", "n", "off"].includes(s)) return false;
+  return undefined;
+}
+
+/** Constrói WHERE dinâmico de forma segura (multi-termo, case-insensitive) */
+function buildWhere({ search, coin, exibicao }) {
   const parts = [];
-  if (q && String(q).trim()) {
-    const pattern = `%${String(q).trim()}%`;
-    parts.push(sql`(nome ILIKE ${pattern} OR modelo ILIKE ${pattern} OR coin ILIKE ${pattern})`);
+
+  // — Pesquisa multi-termo
+  if (search && String(search).trim()) {
+    const terms = String(search).trim().split(/\s+/).filter(Boolean);
+    for (const term of terms) {
+      const pattern = `%${term}%`;
+      // cada termo tem de existir numa das colunas (OR); todos os termos são AND entre si
+      parts.push(
+        sql`(nome ILIKE ${pattern} OR modelo ILIKE ${pattern} OR coin ILIKE ${pattern} OR descricao ILIKE ${pattern})`
+      );
+    }
   }
+
+  // — Filtro coin (normaliza para uppercase)
   if (coin && String(coin).trim()) {
     parts.push(sql`coin = ${String(coin).trim().toUpperCase()}`);
   }
-  if (typeof exibicao !== "undefined") {
-    const flag = exibicao === true || exibicao === "true";
-    parts.push(sql`em_exibicao = ${flag}`);
+
+  // — Filtro em_exibicao (aceita true/false/1/0/on/off)
+  const exib = parseBool(exibicao);
+  if (typeof exib === "boolean") {
+    parts.push(sql`em_exibicao = ${exib}`);
   }
+
   if (parts.length === 0) return sql``;
   return sql`WHERE ${sql.join(parts, sql` AND `)}`;
 }
 
-/** GET /api/store-miners?q=&coin=&exibicao=true&limit=10&offset=0 */
+
+/** GET /api/store-miners?q=&search=&coin=&exibicao=true&limit=10&offset=0 */
 export async function getStoreMiners(req, res) {
   try {
-    const { q, coin, exibicao, limit = 10, offset = 0 } = req.query;
+    const { q, search, coin, exibicao, limit = 10, offset = 0 } = req.query;
+
     const _limit = Math.min(Number(limit) || 10, 50);
     const _offset = Math.max(Number(offset) || 0, 0);
 
-    const where = buildWhere({ q, coin, exibicao });
+    // usa q ou search (qualquer um serve)
+    const searchParam = (typeof q === "string" && q.length ? q : search) || "";
+
+    const where = buildWhere({ search: searchParam, coin, exibicao });
 
     const rows = await sql`
       SELECT *
       FROM store_miners
       ${where}
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC NULLS LAST
       LIMIT ${_limit} OFFSET ${_offset}
     `;
 
@@ -54,6 +82,7 @@ export async function getStoreMiners(req, res) {
     res.status(500).json({ error: "Erro ao buscar máquinas da loja." });
   }
 }
+
 
 /** POST /api/store-miners */
 export async function createStoreMiner(req, res) {

@@ -1,5 +1,6 @@
 // controllers/storeMinersController.js
 import { sql } from "../config/db.js";
+import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
 /** Constrói WHERE dinâmico de forma segura */
 function buildWhere({ q, coin, exibicao }) {
@@ -206,39 +207,57 @@ export async function assignStoreMinerToUser(req, res) {
     if (!email || !email.trim()) {
       return res.status(400).json({ error: "Email é obrigatório." });
     }
+    const emailNorm = email.trim();
 
-    const [user] = await sql`
-      SELECT id FROM users WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1
-    `;
-    if (!user) return res.status(404).json({ error: "Utilizador não encontrado pelo email indicado." });
+    // 1) Resolver user_id via Clerk
+    let userId;
+    try {
+      userId = await resolveUserIdByEmail(emailNorm);
+    } catch (e) {
+      // Mapeamento de erros da Clerk para HTTP do teu backend
+      if (e.status === 404) {
+        return res.status(404).json({ error: "Utilizador não encontrado (Clerk)." });
+      }
+      if (e.status === 401 || e.status === 403) {
+        return res
+          .status(502)
+          .json({ error: "Falha na verificação com a Clerk (credenciais inválidas)." });
+      }
+      return res.status(502).json({ error: e.message || "Erro na Clerk API." });
+    }
 
+    // 2) Buscar a máquina da loja
     const [sm] = await sql`SELECT * FROM store_miners WHERE id = ${id} LIMIT 1;`;
     if (!sm) return res.status(404).json({ error: "Máquina da loja não encontrada." });
 
-    // ❗ Duplicados: mesmo user + mesmo modelo + mesma coin + mesmo worker_name (null conta como igual a null)
+    // 3) Evitar duplicados: mesmo user + modelo + coin + worker_name (NULL = NULL)
     const [dup] = await sql`
       SELECT id FROM miners
-      WHERE user_id = ${user.id}
-        AND modelo = ${sm.modelo}
-        AND coin   = ${sm.coin}
+      WHERE user_id = ${userId}
+        AND modelo   = ${sm.modelo}
+        AND coin     = ${sm.coin}
         AND (worker_name IS NOT DISTINCT FROM ${worker_name || null})
       LIMIT 1
     `;
     if (dup) {
-      return res.status(409).json({ error: "Este utilizador já tem uma mineradora igual (modelo/coin/worker)." });
+      return res
+        .status(409)
+        .json({ error: "Este utilizador já tem uma mineradora igual (modelo/coin/worker)." });
     }
 
+    // 4) Normalizar número opcional (preço kWh)
     const normalizeNumber = (v) =>
       v === null || v === undefined || v === "" ? null : Number(String(v).replace(",", "."));
     const precoKwNum = normalizeNumber(preco_kw);
 
+    // 5) Inserir em miners (status offline por omissão)
     const [row] = await sql`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, worker_name, status,
         preco_kw, consumo_kw_hora, created_at, total_horas_online,
         api_key, secret_key, coin, pool
       ) VALUES (
-        ${user.id},
+        ${userId},
         ${sm.nome}, ${sm.modelo}, ${sm.hash_rate},
         ${worker_name || null},
         'offline',

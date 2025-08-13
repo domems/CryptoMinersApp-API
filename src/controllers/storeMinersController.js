@@ -1,24 +1,25 @@
 // controllers/storeMinersController.js
 import { sql } from "../config/db.js";
 
-// Helper para construir WHERE dinamicamente usando o tag SQL
+/** Constrói WHERE dinâmico de forma segura */
 function buildWhere({ q, coin, exibicao }) {
   const parts = [];
-  if (q) {
-    const pattern = `%${q}%`;
+  if (q && String(q).trim()) {
+    const pattern = `%${String(q).trim()}%`;
     parts.push(sql`(nome ILIKE ${pattern} OR modelo ILIKE ${pattern} OR coin ILIKE ${pattern})`);
   }
-  if (coin) {
-    parts.push(sql`coin = ${coin}`);
+  if (coin && String(coin).trim()) {
+    parts.push(sql`coin = ${String(coin).trim().toUpperCase()}`);
   }
   if (typeof exibicao !== "undefined") {
-    const flag = exibicao === "true" || exibicao === true;
+    const flag = exibicao === true || exibicao === "true";
     parts.push(sql`em_exibicao = ${flag}`);
   }
   if (parts.length === 0) return sql``;
   return sql`WHERE ${sql.join(parts, sql` AND `)}`;
 }
 
+/** GET /api/store-miners?q=&coin=&exibicao=true&limit=10&offset=0 */
 export async function getStoreMiners(req, res) {
   try {
     const { q, coin, exibicao, limit = 10, offset = 0 } = req.query;
@@ -53,6 +54,7 @@ export async function getStoreMiners(req, res) {
   }
 }
 
+/** POST /api/store-miners */
 export async function createStoreMiner(req, res) {
   try {
     const {
@@ -68,24 +70,40 @@ export async function createStoreMiner(req, res) {
       em_exibicao,
     } = req.body;
 
-    if (!nome || !modelo || !hash_rate || consumo_kw == null || preco == null || !coin) {
-      return res.status(400).json({ error: "Preencha todos os campos obrigatórios." });
+    // Obrigatórios mínimos p/ tua tabela
+    if (!nome || !modelo || consumo_kw == null || preco == null) {
+      return res
+        .status(400)
+        .json({ error: "Preencha Nome, Modelo, Consumo kW e Preço." });
     }
 
-    const qnt = Number(quantidade || 1);
-    const consumo = Number(consumo_kw);
-    const price = Number(preco);
+    // Números
+    const toNum = (v) =>
+      v === null || v === undefined || v === ""
+        ? null
+        : Number(String(v).replace(",", "."));
+    const consumo = toNum(consumo_kw);
+    const price = toNum(preco);
+    const qnt = Number(quantidade ?? 1);
 
     if (!Number.isFinite(consumo) || !Number.isFinite(price)) {
-      return res.status(400).json({ error: "Consumo kW e Preço devem ser números." });
+      return res
+        .status(400)
+        .json({ error: "Consumo kW e Preço devem ser números válidos." });
     }
+
+    // Default de coin se não vier: 'BTC'
+    const coinSafe =
+      (typeof coin === "string" && coin.trim() && coin.trim().toUpperCase()) ||
+      "BTC";
 
     const [row] = await sql`
       INSERT INTO store_miners (
         nome, modelo, hash_rate, consumo_kw, preco, quantidade, descricao, imagem_url, coin, em_exibicao
       ) VALUES (
-        ${nome}, ${modelo}, ${hash_rate}, ${consumo}, ${price}, ${qnt},
-        ${descricao || ""}, ${imagem_url || ""}, ${coin}, ${!!em_exibicao}
+        ${nome}, ${modelo}, ${hash_rate ?? ""}, ${consumo}, ${price},
+        ${Number.isFinite(qnt) ? qnt : 1},
+        ${descricao ?? ""}, ${imagem_url ?? ""}, ${coinSafe}, ${!!em_exibicao}
       )
       RETURNING *;
     `;
@@ -97,9 +115,12 @@ export async function createStoreMiner(req, res) {
   }
 }
 
+/** PUT /api/store-miners/:id */
 export async function updateStoreMiner(req, res) {
   try {
     const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "ID em falta." });
+
     const {
       nome,
       modelo,
@@ -109,35 +130,44 @@ export async function updateStoreMiner(req, res) {
       quantidade,
       descricao,
       imagem_url,
-      coin,
+      coin, // pode não vir: se não vier, mantém o valor existente
       em_exibicao,
     } = req.body;
 
-    if (!id) return res.status(400).json({ error: "ID em falta." });
-
-    // obrigatórios no update (mantemos simples: o form envia tudo)
-    if (!nome || !modelo || !hash_rate || consumo_kw == null || preco == null || !coin) {
-      return res.status(400).json({ error: "Preencha todos os campos obrigatórios." });
+    if (!nome || !modelo || consumo_kw == null || preco == null) {
+      return res
+        .status(400)
+        .json({ error: "Preencha Nome, Modelo, Consumo kW e Preço." });
     }
 
-    const qnt = Number(quantidade || 1);
-    const consumo = Number(consumo_kw);
-    const price = Number(preco);
+    const toNum = (v) =>
+      v === null || v === undefined || v === ""
+        ? null
+        : Number(String(v).replace(",", "."));
+    const consumo = toNum(consumo_kw);
+    const price = toNum(preco);
+    const qnt = Number(quantidade ?? 1);
+
+    // coin opcional no update: normaliza se vier, caso contrário deixa a existente
+    const coinNormalized =
+      typeof coin === "string" && coin.trim()
+        ? coin.trim().toUpperCase()
+        : null;
 
     const [row] = await sql`
       UPDATE store_miners
       SET
-        nome = ${nome},
-        modelo = ${modelo},
-        hash_rate = ${hash_rate},
-        consumo_kw = ${consumo},
-        preco = ${price},
-        quantidade = ${qnt},
-        descricao = ${descricao || ""},
-        imagem_url = ${imagem_url || ""},
-        coin = ${coin},
-        em_exibicao = ${!!em_exibicao},
-        updated_at = NOW()
+        nome         = ${nome},
+        modelo       = ${modelo},
+        hash_rate    = ${hash_rate ?? ""}, 
+        consumo_kw   = ${consumo},
+        preco        = ${price},
+        quantidade   = ${Number.isFinite(qnt) ? qnt : 1},
+        descricao    = ${descricao ?? ""},
+        imagem_url   = ${imagem_url ?? ""},
+        coin         = COALESCE(NULLIF(${coinNormalized}, ''), coin),
+        em_exibicao  = ${!!em_exibicao},
+        updated_at   = NOW()
       WHERE id = ${id}
       RETURNING *;
     `;
@@ -151,6 +181,7 @@ export async function updateStoreMiner(req, res) {
   }
 }
 
+/** DELETE /api/store-miners/:id */
 export async function deleteStoreMiner(req, res) {
   try {
     const { id } = req.params;

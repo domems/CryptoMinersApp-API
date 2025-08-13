@@ -6,27 +6,47 @@ import { assertAdminFromHeader, resolveUserIdByEmail } from "../utils/admin-help
 const router = express.Router();
 
 /**
- * GET /api/admin/invoices-by-email?email=...
+ * GET /api/admin/invoices-by-email?email=...&status=em_curso|pendente|aguarda_pagamento|fechada|pago
  */
 router.get("/admin/invoices-by-email", async (req, res) => {
   try {
     await assertAdminFromHeader(req);
     const email = String(req.query.email || "").trim().toLowerCase();
+    let status = String(req.query.status || "").trim().toLowerCase();
+
     if (!email) return res.status(400).json({ error: "email em falta" });
+
+    const allowed = new Set(["em_curso", "pendente", "aguarda_pagamento", "fechada", "pago"]);
+    if (!allowed.has(status)) status = ""; // ignora inválidos
 
     const userId = await resolveUserIdByEmail(email);
     if (!userId) return res.json([]);
 
-    const saved = await sql/*sql*/`
-      SELECT id, user_id, year, month,
-             COALESCE(subtotal_amount,0) AS subtotal_amount,
-             COALESCE(status,'pendente') AS status,
-             COALESCE(currency_code,'USD') AS currency_code
-      FROM energy_invoices
-      WHERE user_id = ${userId}
-      ORDER BY year DESC, month DESC
-    `;
+    // Faturas guardadas (filtradas por status se aplicável e se não for "em_curso")
+    let saved;
+    if (status && status !== "em_curso") {
+      saved = await sql/*sql*/`
+        SELECT id, user_id, year, month,
+               COALESCE(subtotal_amount,0) AS subtotal_amount,
+               COALESCE(status,'pendente') AS status,
+               COALESCE(currency_code,'USD') AS currency_code
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND status = ${status}
+        ORDER BY year DESC, month DESC
+      `;
+    } else {
+      saved = await sql/*sql*/`
+        SELECT id, user_id, year, month,
+               COALESCE(subtotal_amount,0) AS subtotal_amount,
+               COALESCE(status,'pendente') AS status,
+               COALESCE(currency_code,'USD') AS currency_code
+        FROM energy_invoices
+        WHERE user_id = ${userId}
+        ORDER BY year DESC, month DESC
+      `;
+    }
 
+    // Fatura em curso (on-the-fly)
     const now = new Date();
     const y = now.getFullYear();
     const m = now.getMonth() + 1;
@@ -39,6 +59,7 @@ router.get("/admin/invoices-by-email", async (req, res) => {
       FROM miners
       WHERE user_id = ${userId}
     `;
+
     const subtotalCurrent = +miners.reduce((acc, r) => {
       const hours = Number(r.hours_online) || 0;
       const consumo = Number(r.consumo_kw_hora) || 0;
@@ -62,18 +83,21 @@ router.get("/admin/invoices-by-email", async (req, res) => {
       currency_code,
     };
 
-    return res.json([
-      currentRow,
-      ...saved.map(r => ({
-        id: Number(r.id),
-        user_id: String(r.user_id),
-        year: Number(r.year),
-        month: Number(r.month),
-        subtotal_amount: Number(r.subtotal_amount),
-        status: String(r.status),
-        currency_code: String(r.currency_code || "USD"),
-      }))
-    ]);
+    const mappedSaved = saved.map((r) => ({
+      id: Number(r.id),
+      user_id: String(r.user_id),
+      year: Number(r.year),
+      month: Number(r.month),
+      subtotal_amount: Number(r.subtotal_amount),
+      status: String(r.status),
+      currency_code: String(r.currency_code || "USD"),
+    }));
+
+    // Montar payload conforme filtro
+    const includeCurrent = !status || status === "em_curso";
+    const payload = includeCurrent ? [currentRow, ...mappedSaved] : mappedSaved;
+
+    res.json(payload);
   } catch (e) {
     console.error("GET /admin/invoices-by-email:", e);
     res.status(500).json({ error: "Erro ao listar faturas (admin)" });
@@ -161,8 +185,8 @@ router.post("/admin/invoices/close-now", async (req, res) => {
         year,
         month,
         status: "pendente",
-        subtotal_amount: +subtotal.toFixed(2)
-      }
+        subtotal_amount: +subtotal.toFixed(2),
+      },
     });
   } catch (e) {
     console.error("POST /admin/invoices/close-now:", e);

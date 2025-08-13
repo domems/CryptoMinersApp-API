@@ -2,8 +2,7 @@
 import { sql } from "../config/db.js";
 import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
-/** Constrói WHERE dinâmico de forma segura */
-// helpers no topo (antes das funções)
+// --- helpers (coloca no topo, substituindo a tua buildWhere) ---
 function parseBool(v) {
   if (v === undefined || v === null) return undefined;
   const s = String(v).trim().toLowerCase();
@@ -12,37 +11,36 @@ function parseBool(v) {
   return undefined;
 }
 
-/** Constrói WHERE dinâmico de forma segura (multi-termo, case-insensitive) */
-function buildWhere({ search, coin, exibicao }) {
-  const parts = [];
+function buildFilters({ search, coin, exibicao }) {
+  const filters = [];
 
-  // — Pesquisa multi-termo
-  if (search && String(search).trim()) {
-    const terms = String(search).trim().split(/\s+/).filter(Boolean);
-    for (const term of terms) {
-      const pattern = `%${term}%`;
-      // cada termo tem de existir numa das colunas (OR); todos os termos são AND entre si
-      parts.push(
-        sql`(nome ILIKE ${pattern} OR modelo ILIKE ${pattern} OR coin ILIKE ${pattern} OR descricao ILIKE ${pattern})`
-      );
-    }
+  // termos de pesquisa (multi-termo, cada termo tem de aparecer numa das colunas)
+  const terms = String(search || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  for (const term of terms) {
+    const pattern = `%${term}%`;
+    filters.push(
+      sql`AND (nome ILIKE ${pattern} OR modelo ILIKE ${pattern} OR coin ILIKE ${pattern} OR descricao ILIKE ${pattern})`
+      // se quiseres incluir hash_rate (texto):  OR hash_rate ILIKE ${pattern}
+    );
   }
 
-  // — Filtro coin (normaliza para uppercase)
   if (coin && String(coin).trim()) {
-    parts.push(sql`coin = ${String(coin).trim().toUpperCase()}`);
+    filters.push(sql`AND coin = ${String(coin).trim().toUpperCase()}`);
   }
 
-  // — Filtro em_exibicao (aceita true/false/1/0/on/off)
   const exib = parseBool(exibicao);
   if (typeof exib === "boolean") {
-    parts.push(sql`em_exibicao = ${exib}`);
+    filters.push(sql`AND em_exibicao = ${exib}`);
   }
 
-  if (parts.length === 0) return sql``;
-  return sql`WHERE ${sql.join(parts, sql` AND `)}`;
+  // concatena todos os fragmentos em segurança
+  const filterSql = filters.reduce((acc, frag) => sql`${acc} ${frag}`, sql``);
+  return { filterSql };
 }
-
 
 /** GET /api/store-miners?q=&search=&coin=&exibicao=true&limit=10&offset=0 */
 export async function getStoreMiners(req, res) {
@@ -52,15 +50,16 @@ export async function getStoreMiners(req, res) {
     const _limit = Math.min(Number(limit) || 10, 50);
     const _offset = Math.max(Number(offset) || 0, 0);
 
-    // usa q ou search (qualquer um serve)
+    // usa q ou search (ambos funcionam)
     const searchParam = (typeof q === "string" && q.length ? q : search) || "";
 
-    const where = buildWhere({ search: searchParam, coin, exibicao });
+    const { filterSql } = buildFilters({ search: searchParam, coin, exibicao });
 
     const rows = await sql`
       SELECT *
       FROM store_miners
-      ${where}
+      WHERE 1=1
+      ${filterSql}
       ORDER BY created_at DESC NULLS LAST
       LIMIT ${_limit} OFFSET ${_offset}
     `;
@@ -68,7 +67,8 @@ export async function getStoreMiners(req, res) {
     const [{ count }] = await sql`
       SELECT COUNT(*)::int AS count
       FROM store_miners
-      ${where}
+      WHERE 1=1
+      ${filterSql}
     `;
 
     res.json({
@@ -82,7 +82,6 @@ export async function getStoreMiners(req, res) {
     res.status(500).json({ error: "Erro ao buscar máquinas da loja." });
   }
 }
-
 
 /** POST /api/store-miners */
 export async function createStoreMiner(req, res) {

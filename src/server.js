@@ -11,6 +11,7 @@ import { startAllJobs } from "./jobs/index.js";
 import invoicesRoutes from "./routes/invoices.js";
 import paymentsRoutes from "./routes/payments.js";
 import minersAdminRoutes from "./routes/minersAdminRoutes.js";
+import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.use("/api/store-miners", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
 app.use("/api/admin", minersAdminRoutes);
+app.use("/api", adminInvoicesRouter);
 
 // raiz
 app.get("/", (_req, res) => {

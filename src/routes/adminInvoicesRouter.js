@@ -6,7 +6,58 @@ import { assertAdminFromHeader, resolveUserIdByEmail } from "../utils/admin-help
 const router = express.Router();
 
 /**
- * GET /api/admin/invoices-by-email?email=...&status=em_curso|pendente|aguarda_pagamento|fechada|pago
+ * GET /api/admin/invoices-feed?limit=10&offset=0&status=...
+ * Lista global paginada (sem email). Não inclui linha "em_curso".
+ */
+router.get("/admin/invoices-feed", async (req, res) => {
+  try {
+    await assertAdminFromHeader(req);
+
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "10"), 10) || 10, 1), 50); // 1..50
+    const offset = Math.max(parseInt(String(req.query.offset || "0"), 10) || 0, 0);
+
+    let status = String(req.query.status || "").trim().toLowerCase();
+    const allowed = new Set(["em_curso", "pendente", "aguarda_pagamento", "fechada", "pago"]);
+    if (!allowed.has(status)) status = ""; // ignora inválidos
+
+    // monta WHERE dinamicamente
+    const where = status ? sql`WHERE status = ${status}` : sql``;
+
+    const items = await sql/*sql*/`
+      SELECT id, user_id, year, month,
+             COALESCE(subtotal_amount,0) AS subtotal_amount,
+             COALESCE(status,'pendente') AS status,
+             COALESCE(currency_code,'USD') AS currency_code
+      FROM energy_invoices
+      ${where}
+      ORDER BY year DESC, month DESC, id DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const mapped = items.map((r) => ({
+      id: Number(r.id),
+      user_id: String(r.user_id),
+      year: Number(r.year),
+      month: Number(r.month),
+      subtotal_amount: Number(r.subtotal_amount),
+      status: String(r.status),
+      currency_code: String(r.currency_code || "USD"),
+    }));
+
+    // determina hasMore com uma “espreitadela” simples
+    const nextOffset = offset + mapped.length;
+    const hasMore = mapped.length === limit;
+
+    res.json({ items: mapped, nextOffset, hasMore });
+  } catch (e) {
+    console.error("GET /admin/invoices-feed:", e);
+    res.status(500).json({ error: "Erro ao listar faturas (feed)" });
+  }
+});
+
+/**
+ * GET /api/admin/invoices-by-email?email=...&status=...
+ * Lista faturas do cliente por email (inclui linha "em_curso" se status for vazio ou 'em_curso')
  */
 router.get("/admin/invoices-by-email", async (req, res) => {
   try {
@@ -14,7 +65,12 @@ router.get("/admin/invoices-by-email", async (req, res) => {
     const email = String(req.query.email || "").trim().toLowerCase();
     let status = String(req.query.status || "").trim().toLowerCase();
 
-    if (!email) return res.status(400).json({ error: "email em falta" });
+    if (!email) {
+      // sem email → delega para o feed global (primeira página por conveniência)
+      req.query.limit = req.query.limit || "10";
+      req.query.offset = req.query.offset || "0";
+      return router.handle(req, res); // cai no handler certo acima
+    }
 
     const allowed = new Set(["em_curso", "pendente", "aguarda_pagamento", "fechada", "pago"]);
     if (!allowed.has(status)) status = ""; // ignora inválidos
@@ -22,7 +78,7 @@ router.get("/admin/invoices-by-email", async (req, res) => {
     const userId = await resolveUserIdByEmail(email);
     if (!userId) return res.json([]);
 
-    // Faturas guardadas (filtradas por status se aplicável e se não for "em_curso")
+    // Faturas guardadas (filtradas por status se aplicável e != em_curso)
     let saved;
     if (status && status !== "em_curso") {
       saved = await sql/*sql*/`
@@ -93,7 +149,6 @@ router.get("/admin/invoices-by-email", async (req, res) => {
       currency_code: String(r.currency_code || "USD"),
     }));
 
-    // Montar payload conforme filtro
     const includeCurrent = !status || status === "em_curso";
     const payload = includeCurrent ? [currentRow, ...mappedSaved] : mappedSaved;
 

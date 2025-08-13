@@ -8,6 +8,7 @@ export async function resolveUserIdByEmail(email) {
       Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}`,
       "Content-Type": "application/json",
     },
+    // timeout opcional com AbortController se quiseres
   });
 
   const raw = await res.text();
@@ -15,7 +16,15 @@ export async function resolveUserIdByEmail(email) {
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error("Resposta inesperada da Clerk API");
+    const e = new Error("Resposta inesperada da Clerk API");
+    e.status = 502;
+    throw e;
+  }
+
+  if (!res.ok) {
+    const e = new Error(data?.error?.message || `Clerk API HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
   }
 
   if (!Array.isArray(data) || data.length === 0) {
@@ -23,5 +32,6 @@ export async function resolveUserIdByEmail(email) {
     e.status = 404;
     throw e;
   }
-  return data[0].id; // Clerk user id
+
+  return data[0].id;
 }

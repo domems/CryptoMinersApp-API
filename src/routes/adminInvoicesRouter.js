@@ -1,36 +1,32 @@
 // backend/routes/adminInvoicesRouter.js
 import express from "express";
 import { sql } from "../config/db.js";
-// importa o helper que já usas no /admin/miners-by-email
-import { resolveUserIdByEmail, assertAdminFromHeader } from "../utils/admin-helpers.js";
+import { assertAdminFromHeader, resolveUserIdByEmail } from "../utils/admin-helpers.js";
 
 const router = express.Router();
 
 /**
  * GET /api/admin/invoices-by-email?email=...
- * Lista faturas do cliente por email (inclui "em_curso")
  */
 router.get("/admin/invoices-by-email", async (req, res) => {
   try {
-    await assertAdminFromHeader(req); // valida admin via "x-user-email"
+    await assertAdminFromHeader(req);
     const email = String(req.query.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "email em falta" });
 
     const userId = await resolveUserIdByEmail(email);
-    if (!userId) return res.json([]); // sem utilizador
+    if (!userId) return res.json([]);
 
-    // faturas guardadas
     const saved = await sql/*sql*/`
       SELECT id, user_id, year, month,
              COALESCE(subtotal_amount,0) AS subtotal_amount,
              COALESCE(status,'pendente') AS status,
-             COALESCE(currency_code,'EUR') AS currency_code
+             COALESCE(currency_code,'USD') AS currency_code
       FROM energy_invoices
       WHERE user_id = ${userId}
       ORDER BY year DESC, month DESC
     `;
 
-    // fatura em curso (on-the-fly)
     const now = new Date();
     const y = now.getFullYear();
     const m = now.getMonth() + 1;
@@ -51,14 +47,13 @@ router.get("/admin/invoices-by-email", async (req, res) => {
     }, 0).toFixed(2);
 
     const currencyRow = await sql/*sql*/`
-      SELECT COALESCE(MAX(currency_code),'EUR') AS currency_code
+      SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
       FROM energy_invoices
       WHERE user_id = ${userId}
     `;
-    const currency_code = String(currencyRow?.[0]?.currency_code || "EUR");
+    const currency_code = String(currencyRow?.[0]?.currency_code || "USD");
 
     const currentRow = {
-      // sem id porque ainda não está fechada/gravada
       user_id: userId,
       year: y,
       month: m,
@@ -67,15 +62,18 @@ router.get("/admin/invoices-by-email", async (req, res) => {
       currency_code,
     };
 
-    return res.json([currentRow, ...saved.map(r => ({
-      id: Number(r.id),
-      user_id: String(r.user_id),
-      year: Number(r.year),
-      month: Number(r.month),
-      subtotal_amount: Number(r.subtotal_amount),
-      status: String(r.status),
-      currency_code: String(r.currency_code || "EUR"),
-    }))]);
+    return res.json([
+      currentRow,
+      ...saved.map(r => ({
+        id: Number(r.id),
+        user_id: String(r.user_id),
+        year: Number(r.year),
+        month: Number(r.month),
+        subtotal_amount: Number(r.subtotal_amount),
+        status: String(r.status),
+        currency_code: String(r.currency_code || "USD"),
+      }))
+    ]);
   } catch (e) {
     console.error("GET /admin/invoices-by-email:", e);
     res.status(500).json({ error: "Erro ao listar faturas (admin)" });
@@ -84,8 +82,6 @@ router.get("/admin/invoices-by-email", async (req, res) => {
 
 /**
  * POST /api/admin/invoices/close-now
- * body: { email }
- * Fecha a fatura do mês atual para o cliente indicado
  */
 router.post("/admin/invoices/close-now", async (req, res) => {
   try {
@@ -96,7 +92,6 @@ router.post("/admin/invoices/close-now", async (req, res) => {
     const userId = await resolveUserIdByEmail(email);
     if (!userId) return res.status(404).json({ error: "Utilizador não encontrado" });
 
-    // Reutiliza a tua lógica /invoices/close-now
     const now = new Date();
     const year = now.getFullYear();
     const month = now.getMonth() + 1;
@@ -117,7 +112,7 @@ router.post("/admin/invoices/close-now", async (req, res) => {
 
     const inserted = await sql/*sql*/`
       INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
-      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'EUR')
+      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
       ON CONFLICT (user_id, year, month)
       DO UPDATE SET status = 'pendente'
       RETURNING id
@@ -134,7 +129,7 @@ router.post("/admin/invoices/close-now", async (req, res) => {
 
       await sql/*sql*/`
         INSERT INTO energy_invoice_items
-          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
+          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, pay_amount)
         VALUES
           (${invoiceId}, ${r.id}, ${r.miner_nome}, ${hours}, ${kwh}, ${preco}, ${consumo}, ${amount})
         ON CONFLICT (invoice_id, miner_id) DO UPDATE SET
@@ -143,24 +138,32 @@ router.post("/admin/invoices/close-now", async (req, res) => {
           kwh_used          = EXCLUDED.kwh_used,
           preco_kw          = EXCLUDED.preco_kw,
           consumo_kw_hora   = EXCLUDED.consumo_kw_hora,
-          amount_eur        = EXCLUDED.amount_eur
+          pay_amount        = EXCLUDED.pay_amount
       `;
     }
 
     await sql/*sql*/`
       UPDATE energy_invoices
-      SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente', currency_code = 'EUR'
+      SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente', currency_code = 'USD'
       WHERE id = ${invoiceId}
     `;
 
-    // Zera as horas
     await sql/*sql*/`
       UPDATE miners
       SET total_horas_online = 0
       WHERE user_id = ${userId}
     `;
 
-    return res.json({ ok: true, invoice: { id: invoiceId, year, month, status: "pendente", subtotal_amount: +subtotal.toFixed(2) } });
+    return res.json({
+      ok: true,
+      invoice: {
+        id: invoiceId,
+        year,
+        month,
+        status: "pendente",
+        subtotal_amount: +subtotal.toFixed(2)
+      }
+    });
   } catch (e) {
     console.error("POST /admin/invoices/close-now:", e);
     res.status(500).json({ error: "Erro ao fechar fatura (admin)" });
@@ -169,7 +172,6 @@ router.post("/admin/invoices/close-now", async (req, res) => {
 
 /**
  * GET /api/admin/invoices/:id
- * Devolve header da fatura
  */
 router.get("/admin/invoices/:id", async (req, res) => {
   try {
@@ -180,7 +182,7 @@ router.get("/admin/invoices/:id", async (req, res) => {
     const [inv] = await sql/*sql*/`
       SELECT id, user_id, year, month, status,
              COALESCE(subtotal_amount,0) AS subtotal_amount,
-             COALESCE(currency_code,'EUR') AS currency_code
+             COALESCE(currency_code,'USD') AS currency_code
       FROM energy_invoices
       WHERE id = ${id}
       LIMIT 1
@@ -196,7 +198,7 @@ router.get("/admin/invoices/:id", async (req, res) => {
         month: Number(inv.month),
         status: String(inv.status),
         subtotal_amount: Number(inv.subtotal_amount),
-        currency_code: String(inv.currency_code || "EUR"),
+        currency_code: String(inv.currency_code || "USD"),
       },
     });
   } catch (e) {
@@ -207,7 +209,6 @@ router.get("/admin/invoices/:id", async (req, res) => {
 
 /**
  * PATCH /api/admin/invoices/:id
- * body: { status?, currency_code? }
  */
 router.patch("/admin/invoices/:id", async (req, res) => {
   try {
@@ -237,7 +238,6 @@ router.patch("/admin/invoices/:id", async (req, res) => {
 
 /**
  * DELETE /api/admin/invoices/:id
- * Apaga fatura e respetivos itens
  */
 router.delete("/admin/invoices/:id", async (req, res) => {
   try {

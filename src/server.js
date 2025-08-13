@@ -6,7 +6,7 @@ import rateLimiter from "./middleware/rateLimiter.js";
 import minerRoutes from "./routes/miners.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
-import storeMinersRoutes from "./routes/storeMiners.js";
+import storeMinersRoutes from "./routes/storeMinersRoutes.js";
 import { startAllJobs } from "./jobs/index.js";
 import invoicesRoutes from "./routes/invoices.js";
 import paymentsRoutes from "./routes/payments.js";

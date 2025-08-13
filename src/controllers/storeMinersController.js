@@ -196,3 +196,67 @@ export async function deleteStoreMiner(req, res) {
     res.status(500).json({ error: "Erro ao apagar máquina da loja." });
   }
 }
+
+// POST /api/store-miners/:id/assign
+export async function assignStoreMinerToUser(req, res) {
+  try {
+    const { id } = req.params;
+    const { email, worker_name, preco_kw, pool } = req.body;
+
+    if (!email || !email.trim()) {
+      return res.status(400).json({ error: "Email é obrigatório." });
+    }
+
+    const [user] = await sql`
+      SELECT id FROM users WHERE LOWER(email) = LOWER(${email.trim()}) LIMIT 1
+    `;
+    if (!user) return res.status(404).json({ error: "Utilizador não encontrado pelo email indicado." });
+
+    const [sm] = await sql`SELECT * FROM store_miners WHERE id = ${id} LIMIT 1;`;
+    if (!sm) return res.status(404).json({ error: "Máquina da loja não encontrada." });
+
+    // ❗ Duplicados: mesmo user + mesmo modelo + mesma coin + mesmo worker_name (null conta como igual a null)
+    const [dup] = await sql`
+      SELECT id FROM miners
+      WHERE user_id = ${user.id}
+        AND modelo = ${sm.modelo}
+        AND coin   = ${sm.coin}
+        AND (worker_name IS NOT DISTINCT FROM ${worker_name || null})
+      LIMIT 1
+    `;
+    if (dup) {
+      return res.status(409).json({ error: "Este utilizador já tem uma mineradora igual (modelo/coin/worker)." });
+    }
+
+    const normalizeNumber = (v) =>
+      v === null || v === undefined || v === "" ? null : Number(String(v).replace(",", "."));
+    const precoKwNum = normalizeNumber(preco_kw);
+
+    const [row] = await sql`
+      INSERT INTO miners (
+        user_id, nome, modelo, hash_rate, worker_name, status,
+        preco_kw, consumo_kw_hora, created_at, total_horas_online,
+        api_key, secret_key, coin, pool
+      ) VALUES (
+        ${user.id},
+        ${sm.nome}, ${sm.modelo}, ${sm.hash_rate},
+        ${worker_name || null},
+        'offline',
+        ${precoKwNum},
+        ${sm.consumo_kw},
+        NOW(),
+        0,
+        NULL, NULL,
+        ${sm.coin},
+        ${pool || null}
+      )
+      RETURNING *;
+    `;
+
+    return res.status(201).json(row);
+  } catch (err) {
+    console.error("Erro ao atribuir máquina ao utilizador:", err);
+    return res.status(500).json({ error: "Erro ao atribuir máquina ao utilizador." });
+  }
+}
+

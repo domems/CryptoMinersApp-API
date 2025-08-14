@@ -1,9 +1,8 @@
 import express from "express";
-import { getMinerStatus, getMinersStatusBatch } from "../controllers/statusController.js";
+import { getMinerStatus } from "../controllers/statusController.js";
 
 const router = express.Router();
-router.get("/miners/:id/status", getMinerStatus);
-router.get("/miners/status", getMinersStatusBatch);
+router.get("/miners/:minerId/status", getMinerStatus);
 
 export default router;
 

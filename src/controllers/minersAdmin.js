@@ -18,6 +18,11 @@ function parsePaging(req) {
   return { page, pageSize, offset, limit: pageSize };
 }
 
+function parseCoin(req) {
+  const coin = String(req.query.coin || "").trim().toUpperCase();
+  return coin === "BTC" || coin === "LTC" ? coin : null;
+}
+
 export async function listarMinersPorEmail(req, res) {
   try {
     if (!isAdminReq(req)) {
@@ -27,19 +32,28 @@ export async function listarMinersPorEmail(req, res) {
     const email = String(req.query.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Parâmetro 'email' é obrigatório." });
 
+    const coin = parseCoin(req);
     const { page, pageSize, offset, limit } = parsePaging(req);
 
     const userId = await resolveUserIdByEmail(email);
+
+    const whereCoin = coin ? sql`AND UPPER(coin) = ${coin}` : sql``;
 
     const [items, totalRow] = await Promise.all([
       sql`
         SELECT *
         FROM miners
         WHERE user_id = ${userId}
+        ${whereCoin}
         ORDER BY created_at DESC
         LIMIT ${limit} OFFSET ${offset}
       `,
-      sql`SELECT COUNT(*)::int AS total FROM miners WHERE user_id = ${userId}`,
+      sql`
+        SELECT COUNT(*)::int AS total
+        FROM miners
+        WHERE user_id = ${userId}
+        ${whereCoin}
+      `,
     ]);
 
     return res.json({
@@ -61,16 +75,24 @@ export async function listarTodasAsMiners(req, res) {
       return res.status(403).json({ error: "Acesso negado. Apenas admins." });
     }
 
+    const coin = parseCoin(req);
     const { page, pageSize, offset, limit } = parsePaging(req);
+
+    const whereCoin = coin ? sql`WHERE UPPER(coin) = ${coin}` : sql``;
 
     const [items, totalRow] = await Promise.all([
       sql`
         SELECT *
         FROM miners
+        ${whereCoin}
         ORDER BY created_at DESC
         LIMIT ${limit} OFFSET ${offset}
       `,
-      sql`SELECT COUNT(*)::int AS total FROM miners`,
+      sql`
+        SELECT COUNT(*)::int AS total
+        FROM miners
+        ${whereCoin}
+      `,
     ]);
 
     return res.json({

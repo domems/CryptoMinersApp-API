@@ -2,35 +2,86 @@
 import { sql } from "../config/db.js";
 import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
-// mantém a tua lista de admins como já tens
 const adminEmails = ["domems@gmail.com", "admin2@email.com"];
+
+function isAdminReq(req) {
+  const requesterEmail = (req.header("x-user-email") || "").toLowerCase();
+  return adminEmails.includes(requesterEmail);
+}
+
+function parsePaging(req) {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || req.query.limit || 10)));
+  const offset = Number.isFinite(Number(req.query.offset))
+    ? Math.max(0, Number(req.query.offset))
+    : (page - 1) * pageSize;
+  return { page, pageSize, offset, limit: pageSize };
+}
 
 export async function listarMinersPorEmail(req, res) {
   try {
-    // Verificação de admin — usa o que já tens no frontend (x-user-email) OU token Clerk (se já tiveres middleware)
-    const requesterEmail = (req.header("x-user-email") || "").toLowerCase();
-    if (!adminEmails.includes(requesterEmail)) {
+    if (!isAdminReq(req)) {
       return res.status(403).json({ error: "Acesso negado. Apenas admins." });
     }
 
     const email = String(req.query.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Parâmetro 'email' é obrigatório." });
 
-    // 1) Resolve email → Clerk user_id
+    const { page, pageSize, offset, limit } = parsePaging(req);
+
     const userId = await resolveUserIdByEmail(email);
 
-    // 2) Vai buscar as mineradoras desse utilizador
-    const miners = await sql`
-      SELECT *
-      FROM miners
-      WHERE user_id = ${userId}
-      ORDER BY created_at DESC
-    `;
+    const [items, totalRow] = await Promise.all([
+      sql`
+        SELECT *
+        FROM miners
+        WHERE user_id = ${userId}
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `,
+      sql`SELECT COUNT(*)::int AS total FROM miners WHERE user_id = ${userId}`,
+    ]);
 
-    return res.json(miners);
+    return res.json({
+      items,
+      total: totalRow?.[0]?.total ?? items.length,
+      page,
+      pageSize,
+    });
   } catch (err) {
     console.error("listarMinersPorEmail:", err);
     const status = err?.status || 500;
     return res.status(status).json({ error: err.message || "Erro ao listar miners por email." });
+  }
+}
+
+export async function listarTodasAsMiners(req, res) {
+  try {
+    if (!isAdminReq(req)) {
+      return res.status(403).json({ error: "Acesso negado. Apenas admins." });
+    }
+
+    const { page, pageSize, offset, limit } = parsePaging(req);
+
+    const [items, totalRow] = await Promise.all([
+      sql`
+        SELECT *
+        FROM miners
+        ORDER BY created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `,
+      sql`SELECT COUNT(*)::int AS total FROM miners`,
+    ]);
+
+    return res.json({
+      items,
+      total: totalRow?.[0]?.total ?? items.length,
+      page,
+      pageSize,
+    });
+  } catch (err) {
+    console.error("listarTodasAsMiners:", err);
+    const status = err?.status || 500;
+    return res.status(status).json({ error: err.message || "Erro ao listar todas as miners." });
   }
 }

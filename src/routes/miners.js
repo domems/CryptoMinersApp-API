@@ -15,7 +15,7 @@ const router = express.Router();
 router.get("/miners/:id", obterMinerPorId); // <-- esta deve vir antes da rota :userId
 router.put("/admin/:id", atualizarMinerComoAdmin);
 router.put("/cliente/:id", atualizarMinerComoCliente);
-router.put("/:id/status", atualizarStatusMiner);
+//router.put("/:id/status", atualizarStatusMiner);
 router.delete("/:id", apagarMiner);
 
 // Rota de listagem por userId deve ser a ÚLTIMA

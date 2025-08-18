@@ -22,6 +22,23 @@ const tail = (s) => {
 /** compara tails (case-insensitive, preserva zeros à esquerda) */
 const sameTail = (a, b) => low(tail(a)) === low(tail(b));
 
+/** estado online sem falsos positivos (ex.: "unactive" NÃO é "active") */
+function isOnlineFrom(w) {
+  const hr = Number(w?.hashrate_10min ?? 0);
+  if (Number.isFinite(hr) && hr > 0) return true;
+
+  const ws = low(w?.worker_status ?? "");
+  // negativos primeiro — comparação EXATA
+  const NEG = new Set(["unactive", "inactive", "offline", "down", "dead"]);
+  if (NEG.has(ws)) return false;
+
+  // positivos — comparação EXATA
+  const POS = new Set(["active", "online", "alive", "running", "up", "ok"]);
+  if (POS.has(ws)) return true;
+
+  return false; // desconhecido -> offline
+}
+
 async function fetchViaBTCList(apiKey, coinRaw) {
   const coin = String(coinRaw ?? "");
   const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
@@ -81,7 +98,7 @@ export async function runUptimeViaBTCOnce() {
     for (const [k, list] of groups) {
       const [apiKey, coin] = k.split("|");
       try {
-        // 1) construir mapa de interesse: tail -> [ids]
+        // 1) mapa de interesse: tail -> [ids]
         const tailToIds = new Map();
         for (const m of list) {
           const t = tail(m.worker_name);
@@ -99,9 +116,8 @@ export async function runUptimeViaBTCOnce() {
         const idsOnline = [];
         for (const w of workers) {
           const tw = tail(w.worker_name);
-          if (!tailsWanted.has(tw)) continue; // ignora tudo o resto da conta
-          const online = w.hashrate_10min > 0 || low(w.worker_status).includes("active");
-          if (!online) continue;
+          if (!tailsWanted.has(tw)) continue; // ignora o resto da conta
+          if (!isOnlineFrom(w)) continue;     // <<< fix aqui (sem includes)
           // pode haver (raramente) múltiplos miners com o mesmo tail na BD
           const ids = tailToIds.get(tw) || [];
           idsOnline.push(...ids);

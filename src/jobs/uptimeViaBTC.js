@@ -10,22 +10,17 @@ function slotISO(d = new Date()) {
   return t.toISOString();
 }
 
-// helpers de matching
+// helpers
 const norm = (s) => String(s ?? "").trim();
 const low  = (s) => norm(s).toLowerCase();
+/** usa só o sufixo depois do último "." (mantém zeros à esquerda) */
 const tail = (s) => {
   const str = norm(s);
   const i = str.lastIndexOf(".");
-  return i >= 0 ? str.slice(i + 1) : str; // <= ignora tudo à esquerda do "."
+  return i >= 0 ? str.slice(i + 1) : str;
 };
-
-function matchWorkerName(apiName, dbName) {
-  const A = tail(apiName);
-  const B = tail(dbName);
-  if (!A || !B) return false;
-  // comparação case-insensitive, mantendo zeros à esquerda
-  return low(A) === low(B);
-}
+/** compara tails (case-insensitive, preserva zeros à esquerda) */
+const sameTail = (a, b) => low(tail(a)) === low(tail(b));
 
 async function fetchViaBTCList(apiKey, coinRaw) {
   const coin = String(coinRaw ?? "");
@@ -42,7 +37,6 @@ async function fetchViaBTCList(apiKey, coinRaw) {
 
 let lastSlot = null;
 const updatedInSlot = new Set();
-
 function beginSlot(s) {
   if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); }
 }
@@ -64,7 +58,7 @@ export async function runUptimeViaBTCOnce() {
   let groupErrors = 0;
 
   try {
-    // agrupa por (api_key, coin)
+    // agrupar por (api_key, coin)
     const miners = await sql/*sql*/`
       SELECT id, worker_name, api_key, coin
       FROM miners
@@ -72,7 +66,7 @@ export async function runUptimeViaBTCOnce() {
     `;
     totalMiners = miners.length;
     if (!totalMiners) {
-      console.log(`[uptime:viabtc] ${sISO} groups=0 miners=0 workers=0 online=0 dur=${Date.now() - t0}ms`);
+      console.log(`[uptime:viabtc] ${sISO} groups=0 miners=0 workers=0 online=0 errs=0 dur=${Date.now() - t0}ms`);
       return { ok: true, updated: 0 };
     }
 
@@ -87,17 +81,30 @@ export async function runUptimeViaBTCOnce() {
     for (const [k, list] of groups) {
       const [apiKey, coin] = k.split("|");
       try {
+        // 1) construir mapa de interesse: tail -> [ids]
+        const tailToIds = new Map();
+        for (const m of list) {
+          const t = tail(m.worker_name);
+          if (!t) continue;
+          if (!tailToIds.has(t)) tailToIds.set(t, []);
+          tailToIds.get(t).push(m.id);
+        }
+        const tailsWanted = new Set(tailToIds.keys());
+
+        // 2) fetch único para o grupo
         const workers = await fetchViaBTCList(apiKey, coin);
         totalWorkersFetched += workers.length;
 
-        // escolher ids online
+        // 3) filtrar apenas workers cujo tail interessa ao grupo
         const idsOnline = [];
-        for (const m of list) {
-          const w = workers.find((x) => matchWorkerName(x.worker_name, m.worker_name));
-          if (!w) continue;
-          if (w.hashrate_10min > 0 || low(w.worker_status).includes("active")) {
-            idsOnline.push(m.id);
-          }
+        for (const w of workers) {
+          const tw = tail(w.worker_name);
+          if (!tailsWanted.has(tw)) continue; // ignora tudo o resto da conta
+          const online = w.hashrate_10min > 0 || low(w.worker_status).includes("active");
+          if (!online) continue;
+          // pode haver (raramente) múltiplos miners com o mesmo tail na BD
+          const ids = tailToIds.get(tw) || [];
+          idsOnline.push(...ids);
         }
 
         const ids = dedupe(idsOnline);
@@ -110,7 +117,7 @@ export async function runUptimeViaBTCOnce() {
           updated += ids.length;
         }
       } catch {
-        groupErrors += 1; // erro silencioso por grupo
+        groupErrors += 1;
       }
     }
 
@@ -128,7 +135,7 @@ export function startUptimeViaBTC() {
   cron.schedule(
     "*/15 * * * *",
     async () => {
-      try { await runUptimeViaBTCOnce(); } catch (e) { /* já é logado dentro */ }
+      try { await runUptimeViaBTCOnce(); } catch {}
     },
     { timezone: "Europe/Lisbon" }
   );

@@ -10,25 +10,35 @@ const CACHE_TTL_MS = 60 * 1000;
 function toLower(s) {
   return String(s ?? "").toLowerCase();
 }
-function normalizeStatus(v) {
-  if (typeof v === "boolean") return v ? "online" : "offline";
-  const s = toLower(v);
-  if (["true","1","yes","online","alive","active","up","ok","running","ativo","ativa","ligado"].some(x => s.includes(x))) return "online";
-  if (["false","0","no","offline","dead","down","inactive","parado","desligado","inativa","unactive"].some(x => s.includes(x))) return "offline";
-  return "offline";
-}
 
 /** devolve o sufixo depois do último "." (ou o próprio nome, se não houver ".") — mantém zeros à esquerda */
 function tail(name) {
-  const s = toLower(String(name ?? "").trim());
+  const s = String(name ?? "").trim().toLowerCase(); // case-insensitive (zeros intactos)
   if (!s) return "";
   const i = s.lastIndexOf(".");
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
-/** compara só pelos sufixos (sem mexer em zeros à esquerda) */
-function matchWorkerName(candidate, wanted) {
-  return tail(candidate) === tail(wanted);
+/** normaliza estado textual sem falsos positivos (ex.: "unactive" NÃO é "active") */
+function normalizeStatus(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+
+  // negativos primeiro (comparação EXATA)
+  const NEG = new Set([
+    "unactive", "inactive", "offline", "down", "dead",
+    "parado", "desligado", "inativa"
+  ]);
+  if (NEG.has(s)) return "offline";
+
+  // positivos (comparação EXATA)
+  const POS = new Set([
+    "active", "online", "alive", "running", "up", "ok",
+    "ativo", "ligado", "ativa"
+  ]);
+  if (POS.has(s)) return "online";
+
+  // desconhecido → offline (conservador)
+  return "offline";
 }
 
 /* ========= controller ========= */
@@ -39,7 +49,7 @@ export async function getMinerStatus(req, res) {
     if (!minerId) return res.status(400).json({ error: "ID da miner inválido." });
 
     // BD: buscar credenciais mínimas + worker alvo
-    const rows = await sql`
+    const rows = await sql/*sql*/`
       SELECT id, api_key, coin, pool, worker_name
       FROM miners
       WHERE id::text = ${minerId}
@@ -49,7 +59,7 @@ export async function getMinerStatus(req, res) {
 
     const { api_key, coin, pool } = rows[0];
     const worker_name_db = rows[0].worker_name ?? "";
-    const expectedTail = tail(worker_name_db); // <= normaliza ANTES de qualquer pedido
+    const expectedTail = tail(worker_name_db); // <= normaliza ANTES do matching
 
     if (!expectedTail) {
       return res.status(400).json({ error: "Miner sem worker_name válido." });
@@ -116,7 +126,13 @@ export async function getMinerStatus(req, res) {
 
     // Regras de online:
     let resolved = "offline";
+    let my_status_raw = null;
+    let my_hashrate_10min = null;
+
     if (my) {
+      my_status_raw = my.worker_status ?? null;
+      my_hashrate_10min = typeof my.hashrate_10min === "number" ? my.hashrate_10min : null;
+
       if (typeof my.hashrate_10min === "number" && my.hashrate_10min > 0) {
         resolved = "online";
       } else if (typeof my.worker_status !== "undefined") {
@@ -137,6 +153,8 @@ export async function getMinerStatus(req, res) {
       worker_name_expected_raw: worker_name_db,
       worker_tail_expected: expectedTail,
       workers_tails: workers.slice(0, 50).map((w) => tail(w.worker_name)),
+      my_status_raw,
+      my_hashrate_10min,
     };
 
     statusCache.set(cacheKey, { data: responseData, timestamp: Date.now() });

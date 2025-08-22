@@ -122,10 +122,12 @@ router.get("/invoices/detail", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
+      // ⬇️ agora também devolve worker_name
       const miners = await sql/*sql*/`
         SELECT
           id,
           COALESCE(nome, CONCAT('Miner#', id::text))   AS miner_nome,
+          COALESCE(worker_name, '')                    AS worker_name,
           COALESCE(total_horas_online,0)               AS hours_online,
           COALESCE(consumo_kw_hora,0)                  AS consumo_kw_hora,
           COALESCE(preco_kw,0)                         AS preco_kw
@@ -140,9 +142,12 @@ router.get("/invoices/detail", async (req, res) => {
         const preco = Number(r.preco_kw) || 0;
         const kwh = +(hours * consumo).toFixed(3);
         const amount = +(kwh * preco).toFixed(2);
+        const worker = String(r.worker_name || "").trim() || null;
+
         return {
           miner_id: r.id,
           miner_nome: String(r.miner_nome),
+          worker_name: worker, // ⬅️ novo campo
           hours_online: hours,
           kwh_used: kwh,
           consumo_kw_hora: consumo,
@@ -183,16 +188,21 @@ router.get("/invoices/detail", async (req, res) => {
     `;
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
+    // ⬇️ juntar à tabela miners para obter worker_name mesmo em faturas antigas
     const items = await sql/*sql*/`
-      SELECT miner_id, miner_nome,
-             COALESCE(hours_online,0)      AS hours_online,
-             COALESCE(kwh_used,0)          AS kwh_used,
-             COALESCE(preco_kw,0)          AS preco_kw,
-             COALESCE(consumo_kw_hora,0)   AS consumo_kw_hora,
-             COALESCE(amount_eur,0)        AS amount_eur
-      FROM energy_invoice_items
-      WHERE invoice_id = ${inv.id}
-      ORDER BY miner_id ASC
+      SELECT 
+        eii.miner_id,
+        eii.miner_nome,
+        COALESCE(eii.hours_online,0)     AS hours_online,
+        COALESCE(eii.kwh_used,0)         AS kwh_used,
+        COALESCE(eii.preco_kw,0)         AS preco_kw,
+        COALESCE(eii.consumo_kw_hora,0)  AS consumo_kw_hora,
+        COALESCE(eii.amount_eur,0)       AS amount_eur,
+        COALESCE(m.worker_name, '')      AS worker_name
+      FROM energy_invoice_items eii
+      LEFT JOIN miners m ON m.id = eii.miner_id
+      WHERE eii.invoice_id = ${inv.id}
+      ORDER BY eii.miner_id ASC
     `;
 
     const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used || 0), 0).toFixed(3);
@@ -210,6 +220,7 @@ router.get("/invoices/detail", async (req, res) => {
       items: items.map((r) => ({
         miner_id: r.miner_id,
         miner_nome: String(r.miner_nome),
+        worker_name: (String(r.worker_name || "").trim() || null), // ⬅️ novo campo
         hours_online: Number(r.hours_online),
         kwh_used: Number(r.kwh_used),
         consumo_kw_hora: Number(r.consumo_kw_hora),

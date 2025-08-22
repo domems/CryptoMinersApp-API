@@ -44,7 +44,7 @@ router.get("/invoices", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
-      // Nota: a lista aqui não precisa de estar ordenada — o detalhe já vem ordenado
+      // (lista resumida para o cartão de "em curso"; no detalhe faremos outra query)
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -70,7 +70,7 @@ router.get("/invoices", async (req, res) => {
           kwh_used: kwh,
           consumo_kw_hora: consumo,
           preco_kw: preco,
-          amount_eur: amount, // legado
+          amount_eur: amount
         };
       });
 
@@ -123,12 +123,14 @@ router.get("/invoices/detail", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
-      // ⬇️ inclui worker_name e já devolve ORDENADO por worker
+      // ⬇️ agora traz também modelo e hash_rate e já ordena por worker_name
       const miners = await sql/*sql*/`
         SELECT
           id,
           COALESCE(nome, CONCAT('Miner#', id::text))   AS miner_nome,
           COALESCE(worker_name, '')                    AS worker_name,
+          COALESCE(modelo, '')                         AS modelo,
+          COALESCE(hash_rate, '')                      AS hash_rate,
           COALESCE(total_horas_online,0)               AS hours_online,
           COALESCE(consumo_kw_hora,0)                  AS consumo_kw_hora,
           COALESCE(preco_kw,0)                         AS preco_kw
@@ -147,11 +149,15 @@ router.get("/invoices/detail", async (req, res) => {
         const kwh = +(hours * consumo).toFixed(3);
         const amount = +(kwh * preco).toFixed(2);
         const worker = String(r.worker_name || "").trim() || null;
+        const modelo = String(r.modelo || "").trim() || null;
+        const hashRate = String(r.hash_rate || "").trim() || null;
 
         return {
           miner_id: r.id,
           miner_nome: String(r.miner_nome),
           worker_name: worker,
+          modelo,
+          hash_rate: hashRate,
           hours_online: hours,
           kwh_used: kwh,
           consumo_kw_hora: consumo,
@@ -165,7 +171,7 @@ router.get("/invoices/detail", async (req, res) => {
 
       return res.json({
         header: {
-          invoice_id: existingId, // pode vir undefined quando ainda não fechaste
+          invoice_id: existingId,
           year: y,
           month: m,
           status: "em_curso",
@@ -192,7 +198,7 @@ router.get("/invoices/detail", async (req, res) => {
     `;
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
-    // ⬇️ Join a miners para trazer worker_name e ORDENAR por worker
+    // ⬇️ junta a tabela miners p/ worker_name, modelo e hash_rate e ordena por worker
     const items = await sql/*sql*/`
       SELECT 
         eii.miner_id,
@@ -202,7 +208,9 @@ router.get("/invoices/detail", async (req, res) => {
         COALESCE(eii.preco_kw,0)         AS preco_kw,
         COALESCE(eii.consumo_kw_hora,0)  AS consumo_kw_hora,
         COALESCE(eii.amount_eur,0)       AS amount_eur,
-        COALESCE(m.worker_name, '')      AS worker_name
+        COALESCE(m.worker_name, '')      AS worker_name,
+        COALESCE(m.modelo, '')           AS modelo,
+        COALESCE(m.hash_rate, '')        AS hash_rate
       FROM energy_invoice_items eii
       LEFT JOIN miners m ON m.id = eii.miner_id
       WHERE eii.invoice_id = ${inv.id}
@@ -228,6 +236,8 @@ router.get("/invoices/detail", async (req, res) => {
         miner_id: r.miner_id,
         miner_nome: String(r.miner_nome),
         worker_name: (String(r.worker_name || "").trim() || null),
+        modelo: (String(r.modelo || "").trim() || null),
+        hash_rate: (String(r.hash_rate || "").trim() || null),
         hours_online: Number(r.hours_online),
         kwh_used: Number(r.kwh_used),
         consumo_kw_hora: Number(r.consumo_kw_hora),
@@ -321,7 +331,6 @@ router.post("/invoices/close-now", async (req, res) => {
 
 /**
  * GET /api/invoices/status?invoiceId=123
- * -> usado pelo app para polling direto do estado da fatura
  */
 router.get("/invoices/status", async (req, res) => {
   try {

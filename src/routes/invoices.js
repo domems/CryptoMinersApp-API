@@ -44,6 +44,7 @@ router.get("/invoices", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
+      // Nota: a lista aqui não precisa de estar ordenada — o detalhe já vem ordenado
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -122,7 +123,7 @@ router.get("/invoices/detail", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
-      // ⬇️ agora também devolve worker_name
+      // ⬇️ inclui worker_name e já devolve ORDENADO por worker
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -133,7 +134,10 @@ router.get("/invoices/detail", async (req, res) => {
           COALESCE(preco_kw,0)                         AS preco_kw
         FROM miners
         WHERE user_id = ${userId}
-        ORDER BY id ASC
+        ORDER BY
+          CASE WHEN NULLIF(worker_name,'') IS NULL THEN 1 ELSE 0 END,
+          LOWER(COALESCE(NULLIF(worker_name,''), nome, CONCAT('Miner#', id::text))),
+          id ASC
       `;
 
       const items = miners.map((r) => {
@@ -147,7 +151,7 @@ router.get("/invoices/detail", async (req, res) => {
         return {
           miner_id: r.id,
           miner_nome: String(r.miner_nome),
-          worker_name: worker, // ⬅️ novo campo
+          worker_name: worker,
           hours_online: hours,
           kwh_used: kwh,
           consumo_kw_hora: consumo,
@@ -188,7 +192,7 @@ router.get("/invoices/detail", async (req, res) => {
     `;
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
-    // ⬇️ juntar à tabela miners para obter worker_name mesmo em faturas antigas
+    // ⬇️ Join a miners para trazer worker_name e ORDENAR por worker
     const items = await sql/*sql*/`
       SELECT 
         eii.miner_id,
@@ -202,7 +206,10 @@ router.get("/invoices/detail", async (req, res) => {
       FROM energy_invoice_items eii
       LEFT JOIN miners m ON m.id = eii.miner_id
       WHERE eii.invoice_id = ${inv.id}
-      ORDER BY eii.miner_id ASC
+      ORDER BY
+        CASE WHEN NULLIF(m.worker_name,'') IS NULL THEN 1 ELSE 0 END,
+        LOWER(COALESCE(NULLIF(m.worker_name,''), eii.miner_nome)),
+        eii.miner_id ASC
     `;
 
     const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used || 0), 0).toFixed(3);
@@ -220,7 +227,7 @@ router.get("/invoices/detail", async (req, res) => {
       items: items.map((r) => ({
         miner_id: r.miner_id,
         miner_nome: String(r.miner_nome),
-        worker_name: (String(r.worker_name || "").trim() || null), // ⬅️ novo campo
+        worker_name: (String(r.worker_name || "").trim() || null),
         hours_online: Number(r.hours_online),
         kwh_used: Number(r.kwh_used),
         consumo_kw_hora: Number(r.consumo_kw_hora),

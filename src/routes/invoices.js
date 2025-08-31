@@ -275,80 +275,58 @@ router.get("/invoices/detail", async (req, res) => {
   }
 });
 
-/**
- * POST /api/invoices/close-now
- * Cria SEMPRE uma nova fatura (sem ON CONFLICT). Se houver constraint antiga, verás 23505 nos logs e no body.
- */
+
+// POST /api/invoices/close-now
 router.post("/invoices/close-now", async (req, res) => {
   const userId = String(req.body?.userId || "");
   console.log("[POST] /invoices/close-now START", { userId, at: new Date().toISOString() });
-
-  if (!userId) {
-    console.warn("[POST] /invoices/close-now -> 400 userId em falta");
-    return res.status(400).json({ error: "userId em falta" });
-  }
+  if (!userId) return res.status(400).json({ error: "userId em falta" });
 
   const { year, month } = currentYearMonth();
 
   try {
-    const rows = await sql/*sql*/`
-      WITH miner_src AS (
-        SELECT
-          m.id                                        AS miner_id,
-          COALESCE(m.nome, CONCAT('Miner#', m.id::text)) AS miner_nome,
-          COALESCE(m.total_horas_online, 0)::numeric  AS hours_online,
-          COALESCE(m.consumo_kw_hora, 0)::numeric     AS consumo_kw_hora,
-          COALESCE(m.preco_kw, 0)::numeric            AS preco_kw,
-          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
-          ROUND(
-            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
-            2
-          )                                           AS amount_eur
-        FROM miners m
-        WHERE m.user_id = ${userId}
-      ),
-      inv AS (
-        INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
-        VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
-        RETURNING id, year, month, created_at
-      ),
-      ins AS (
-        INSERT INTO energy_invoice_items
-          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
-        SELECT
-          (SELECT id FROM inv),
-          s.miner_id, s.miner_nome, s.hours_online, s.kwh_used,
-          s.preco_kw, s.consumo_kw_hora, s.amount_eur
-        FROM miner_src s
-        RETURNING 1
-      ),
-      agg AS (
-        SELECT
-          COUNT(*)::int                            AS items_count,
-          COALESCE(SUM(amount_eur), 0)::numeric   AS subtotal
-        FROM miner_src
-      ),
-      upd AS (
-        UPDATE energy_invoices ei
-        SET subtotal_amount = (SELECT subtotal FROM agg),
-            updated_at = NOW(),
-            status = 'pendente'
-        WHERE ei.id = (SELECT id FROM inv)
-        RETURNING ei.id
-      )
+    // 1) cria a fatura (SEM ON CONFLICT)
+    const insertedInv = await sql/*sql*/`
+      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
+      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
+      RETURNING id, created_at
+    `;
+    const invoiceId = Number(insertedInv[0].id);
+
+    // 2) snapshot dos miners -> inserir items desta fatura
+    const insertedItems = await sql/*sql*/`
+      INSERT INTO energy_invoice_items
+        (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
       SELECT
-        (SELECT id FROM inv)          AS id,
-        (SELECT items_count FROM agg) AS items_count,
-        (SELECT subtotal FROM agg)    AS subtotal_amount;
+        ${invoiceId}                                                    AS invoice_id,
+        m.id                                                            AS miner_id,
+        COALESCE(m.nome, CONCAT('Miner#', m.id::text))                  AS miner_nome,
+        COALESCE(m.total_horas_online,0)                                AS hours_online,
+        ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
+        COALESCE(m.preco_kw,0)                                          AS preco_kw,
+        COALESCE(m.consumo_kw_hora,0)                                   AS consumo_kw_hora,
+        ROUND(
+          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
+          2
+        )                                                               AS amount_eur
+      FROM miners m
+      WHERE m.user_id = ${userId}
+      RETURNING amount_eur
+    `;
+    const itemsCount = insertedItems.length;
+    const subtotal = insertedItems.reduce((acc, r) => acc + Number(r.amount_eur || 0), 0);
+    const subtotalRounded = Math.round(subtotal * 100) / 100;
+
+    // 3) atualizar a fatura com o subtotal calculado
+    await sql/*sql*/`
+      UPDATE energy_invoices
+      SET subtotal_amount = ${subtotalRounded}::numeric,
+          updated_at = NOW(),
+          status = 'pendente'
+      WHERE id = ${invoiceId}
     `;
 
-    const row = rows?.[0];
-    if (!row) {
-      console.error("[POST] /invoices/close-now EMPTY_RESULT");
-      return res.status(500).json({ error: "Erro inesperado ao fechar fatura (sem retorno)." });
-    }
-
-    // reset depois de copiar
+    // 4) reset das horas (para a próxima "em curso")
     await sql/*sql*/`
       UPDATE miners
       SET total_horas_online = 0
@@ -356,30 +334,28 @@ router.post("/invoices/close-now", async (req, res) => {
     `;
 
     console.log("[POST] /invoices/close-now OK", {
-      id: row.id,
-      items_count: row.items_count,
-      subtotal: row.subtotal_amount
+      invoiceId, itemsCount, subtotal: subtotalRounded
     });
 
     return res.json({
       ok: true,
       invoice: {
-        id: Number(row.id),
+        id: invoiceId,
         year,
         month,
         status: "pendente",
-        items_count: Number(row.items_count || 0),
-        subtotal_amount: Number(row.subtotal_amount || 0),
+        items_count: itemsCount,
+        subtotal_amount: subtotalRounded,
       },
     });
   } catch (e) {
     console.error("[POST] /invoices/close-now ERROR", {
       code: e?.code, detail: e?.detail, message: e?.message,
     });
-    const msg = e?.detail || e?.message || "Erro ao fechar fatura";
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: e?.detail || e?.message || "Erro ao fechar fatura" });
   }
 });
+
 
 
 

@@ -255,79 +255,96 @@ router.get("/invoices/detail", async (req, res) => {
  * POST /api/invoices/close-now
  */
 router.post("/invoices/close-now", async (req, res) => {
+  const userId = String(req.body?.userId || "");
+  if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+  const { year, month } = currentYearMonth();
+
   try {
-    const userId = String(req.body?.userId || "");
-    if (!userId) return res.status(400).json({ error: "userId em falta" });
-
-    const { year, month } = currentYearMonth();
-
-    const miners = await sql/*sql*/`
-      SELECT
-        id,
-        COALESCE(nome, CONCAT('Miner#', id::text))   AS miner_nome,
-        COALESCE(total_horas_online,0)               AS hours_online,
-        COALESCE(consumo_kw_hora,0)                  AS consumo_kw_hora,
-        COALESCE(preco_kw,0)                         AS preco_kw
-      FROM miners
-      WHERE user_id = ${userId}
-      ORDER BY id ASC
-    `;
-
-    let subtotal = 0;
-
-    const inserted = await sql/*sql*/`
-      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
-      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
-      ON CONFLICT (user_id, year, month)
-      DO UPDATE SET status = 'pendente'
-      RETURNING id
-    `;
-    const invoiceId = inserted[0].id;
-
-    for (const r of miners) {
-      const hours = Number(r.hours_online) || 0;
-      const consumo = Number(r.consumo_kw_hora) || 0;
-      const preco = Number(r.preco_kw) || 0;
-      const kwh = +(hours * consumo).toFixed(3);
-      const amount = +(kwh * preco).toFixed(2);
-      subtotal += amount;
-
-      await sql/*sql*/`
-        INSERT INTO energy_invoice_items
-          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
-        VALUES
-          (${invoiceId}, ${r.id}, ${r.miner_nome}, ${hours}, ${kwh}, ${preco}, ${consumo}, ${amount})
-        ON CONFLICT (invoice_id, miner_id) DO UPDATE SET
-          miner_nome        = EXCLUDED.miner_nome,
-          hours_online      = EXCLUDED.hours_online,
-          kwh_used          = EXCLUDED.kwh_used,
-          preco_kw          = EXCLUDED.preco_kw,
-          consumo_kw_hora   = EXCLUDED.consumo_kw_hora,
-          amount_eur        = EXCLUDED.amount_eur
+    const result = await sql.begin(async (trx) => {
+      // 1) congelar/sincronizar o snapshot dos miners deste user
+      //    (evita corridas se o utilizador clicar duas vezes)
+      const miners = await trx/*sql*/`
+        SELECT
+          id,
+          COALESCE(nome, CONCAT('Miner#', id::text)) AS miner_nome,
+          COALESCE(total_horas_online,0)             AS hours_online,
+          COALESCE(consumo_kw_hora,0)                AS consumo_kw_hora,
+          COALESCE(preco_kw,0)                       AS preco_kw
+        FROM miners
+        WHERE user_id = ${userId}
+        ORDER BY id ASC
+        FOR UPDATE
       `;
-    }
 
-    await sql/*sql*/`
-      UPDATE energy_invoices
-      SET subtotal_amount = ${+subtotal.toFixed(2)}, status = 'pendente', currency_code = 'USD'
-      WHERE id = ${invoiceId}
-    `;
+      // 2) próximo seq para este (user, ano, mês)
+      const [{ next_seq }] = await trx/*sql*/`
+        SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
+      `;
 
-    await sql/*sql*/`
-      UPDATE miners
-      SET total_horas_online = 0
-      WHERE user_id = ${userId}
-    `;
+      // 3) inserir SEM ON CONFLICT (id novo sempre)
+      const [inv] = await trx/*sql*/`
+        INSERT INTO energy_invoices
+          (user_id, year, month, seq, subtotal_amount, status, currency_code)
+        VALUES
+          (${userId}, ${year}, ${month}, ${next_seq}, 0, 'pendente', 'USD')
+        RETURNING id, year, month, seq
+      `;
+      const invoiceId = Number(inv.id);
 
-    return res.json({
-      ok: true,
-      invoice: { id: invoiceId, year, month, status: "pendente", subtotal_amount: +subtotal.toFixed(2) }
+      // 4) gerar items + subtotal
+      let subtotal = 0;
+      for (const r of miners) {
+        const hours   = Number(r.hours_online) || 0;
+        const consumo = Number(r.consumo_kw_hora) || 0;
+        const preco   = Number(r.preco_kw) || 0;
+        const kwh     = +(hours * consumo).toFixed(3);
+        const amount  = +(kwh * preco).toFixed(2);
+        subtotal += amount;
+
+        await trx/*sql*/`
+          INSERT INTO energy_invoice_items
+            (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
+          VALUES
+            (${invoiceId}, ${r.id}, ${r.miner_nome}, ${hours}, ${kwh}, ${preco}, ${consumo}, ${amount})
+        `;
+      }
+
+      // 5) fechar valores da fatura
+      await trx/*sql*/`
+        UPDATE energy_invoices
+        SET subtotal_amount = ${+subtotal.toFixed(2)},
+            status = 'pendente',
+            updated_at = NOW()
+        WHERE id = ${invoiceId}
+      `;
+
+      // 6) reset das horas (ficam a 0 para a próxima "em curso")
+      await trx/*sql*/`
+        UPDATE miners
+        SET total_horas_online = 0
+        WHERE user_id = ${userId}
+      `;
+
+      return {
+        id: invoiceId,
+        year,
+        month,
+        seq: Number(inv.seq),
+        status: "pendente",
+        subtotal_amount: +subtotal.toFixed(2),
+      };
     });
+
+    return res.json({ ok: true, invoice: result });
   } catch (e) {
     console.error("POST /invoices/close-now:", e);
     return res.status(500).json({ error: "Erro ao fechar fatura" });
   }
 });
+
 
 /**
  * GET /api/invoices/status?invoiceId=123

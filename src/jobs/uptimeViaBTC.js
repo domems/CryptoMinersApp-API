@@ -110,6 +110,10 @@ export async function runUptimeViaBTCOnce() {
   let groupErrors = 0;
   let apiCalls = 0;
 
+  // novos contadores de alterações de status
+  let statusToOnline = 0;
+  let statusToOffline = 0;
+
   // limitar concorrência para não bombardear a API
   const CONCURRENCY = 3;
   const queue = [];
@@ -127,11 +131,11 @@ export async function runUptimeViaBTCOnce() {
     totalMiners = miners.length;
 
     if (!totalMiners) {
-      console.log(`[uptime:viabtc] ${sISO} groups=0 miners=0 api=0 workers=0 extra=0 online=0 errs=0 dur=${Date.now() - t0}ms`);
+      console.log(`[uptime:viabtc] ${sISO} groups=0 miners=0 api=0 workers=0 extra=0 online=0 errs=0 statusOn=0 statusOff=0 dur=${Date.now() - t0}ms`);
       return { ok: true, updated: 0 };
     }
 
-    const groups = new Map(); // `${api_key}|${coin}` -> Miner[]
+    const groups = new Map(); // `${api_key}|/${coin}` -> Miner[]
     for (const m of miners) {
       const k = `${m.api_key}|${m.coin}`;
       if (!groups.has(k)) groups.set(k, []);
@@ -154,6 +158,7 @@ export async function runUptimeViaBTCOnce() {
           tailToIds.get(t).push(m.id);
         }
         const tailsWanted = new Set(tailToIds.keys());
+        const allIds = list.map(m => m.id);
 
         // fetch (com caches)
         const { workers, cache } = await getViaBTCWorkersCached(apiKey, coin, sISO);
@@ -171,14 +176,19 @@ export async function runUptimeViaBTCOnce() {
         workersExtra += extra;
 
         // determinar online e acumular ids
-        const idsOnline = [];
+        const onlineIdsRaw = [];
         for (const w of relevant) {
           if (!isOnlineFrom(w)) continue;
           const ids = tailToIds.get(tail(w.worker_name)) || [];
-          idsOnline.push(...ids);
+          onlineIdsRaw.push(...ids);
         }
 
-        const ids = dedupe(idsOnline);
+        // offline = todos os ids do grupo que não estão em online
+        const onlineSet = new Set(onlineIdsRaw);
+        const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
+
+        // 1) Horas online (dedupe por slot para não contar a dobrar)
+        const ids = dedupe(onlineIdsRaw);
         if (ids.length) {
           await sql/*sql*/`
             UPDATE miners
@@ -187,32 +197,53 @@ export async function runUptimeViaBTCOnce() {
           `;
           updated += ids.length;
         }
+
+        // 2) Status (só altera quando diverge — null-safe com IS DISTINCT FROM)
+        if (onlineIdsRaw.length) {
+          const r1 = await sql/*sql*/`
+            UPDATE miners
+            SET status = 'online'
+            WHERE id = ANY(${onlineIdsRaw})
+              AND status IS DISTINCT FROM 'online'
+            RETURNING id
+          `;
+          statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
+        }
+        if (offlineIdsRaw.length) {
+          const r2 = await sql/*sql*/`
+            UPDATE miners
+            SET status = 'offline'
+            WHERE id = ANY(${offlineIdsRaw})
+              AND status IS DISTINCT FROM 'offline'
+            RETURNING id
+          `;
+          statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
+        }
       } catch {
         groupErrors += 1;
       }
     }
 
-    // executa com concorrência limitada
+    // executa com concorrência limitada (mantido como no teu código)
     for (const entry of groupEntries) {
       const p = processGroup(entry);
       queue.push(p);
       if (queue.length >= CONCURRENCY) {
         await Promise.race(queue).catch(() => {});
-        // remove concluídos
-        for (let i = queue.length - 1; i >= 0; i--) {
-          if (queue[i].settled) queue.splice(i, 1);
-        }
+        // (nota: manter como está; se quiseres posso trocar para um limitador mais robusto)
       }
     }
-    // aguarda restantes
     await Promise.allSettled(queue);
 
     console.log(
-      `[uptime:viabtc] ${sISO} groups=${totalGroups} miners=${totalMiners} api=${apiCalls} workers=${workersRelevant} extra=${workersExtra} online=${updated} errs=${groupErrors} dur=${Date.now() - t0}ms`
+      `[uptime:viabtc] ${sISO} groups=${totalGroups} miners=${totalMiners} api=${apiCalls} workers=${workersRelevant} extra=${workersExtra} online(+hrs)=${updated} statusOn=${statusToOnline} statusOff=${statusToOffline} errs=${groupErrors} dur=${Date.now() - t0}ms`
     );
     return {
       ok: true,
-      updated,
+      updated, // nº de miners a quem somámos 0.25h
+      statusChanged: statusToOnline + statusToOffline,
+      statusToOnline,
+      statusToOffline,
       groups: totalGroups,
       miners: totalMiners,
       api: apiCalls,

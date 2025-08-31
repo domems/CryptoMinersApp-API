@@ -291,7 +291,7 @@ router.post("/invoices/close-now", async (req, res) => {
   const { year, month } = currentYearMonth();
 
   try {
-    const [row] = await sql/*sql*/`
+    const rows = await sql/*sql*/`
       WITH inv AS (
         INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
         VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
@@ -316,24 +316,34 @@ router.post("/invoices/close-now", async (req, res) => {
         WHERE m.user_id = ${userId}
         RETURNING amount_eur
       ),
+      agg AS (
+        SELECT COALESCE(SUM(amount_eur), 0) AS subtotal FROM items
+      ),
       upd AS (
         UPDATE energy_invoices ei
-        SET subtotal_amount = (SELECT COALESCE(SUM(amount_eur), 0) FROM items),
+        SET subtotal_amount = (SELECT subtotal FROM agg),
             updated_at = NOW(),
             status = 'pendente'
         WHERE ei.id = (SELECT id FROM inv)
         RETURNING ei.id, ei.subtotal_amount
       ),
-      reset AS (
-        UPDATE miners
-        SET total_horas_online = 0
-        WHERE user_id = ${userId}
-        RETURNING 1
+      final AS (
+        SELECT
+          inv.id,
+          inv.year,
+          inv.month,
+          COALESCE(upd.subtotal_amount, (SELECT subtotal FROM agg), 0) AS subtotal_amount
+        FROM inv
+        LEFT JOIN upd ON upd.id = inv.id
       )
-      SELECT inv.id, inv.year, inv.month, upd.subtotal_amount
-      FROM inv
-      JOIN upd ON upd.id = inv.id;
+      SELECT * FROM final;
     `;
+
+    const row = rows?.[0];
+    if (!row) {
+      console.error("[POST] /invoices/close-now EMPTY_RESULT (inv/agg/upd não retornou)");
+      return res.status(500).json({ error: "Erro inesperado ao fechar fatura (sem retorno)." });
+    }
 
     console.log("[POST] /invoices/close-now OK", row);
     return res.json({
@@ -356,6 +366,7 @@ router.post("/invoices/close-now", async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
 
 /**
  * GET /api/invoices/status?invoiceId=123

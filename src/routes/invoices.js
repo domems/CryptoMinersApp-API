@@ -95,27 +95,22 @@ router.get("/invoices", async (req, res) => {
 /**
  * GET /api/invoices/detail
  * - em curso:   /api/invoices/detail?userId=...&current=1
- * - fechada:    /api/invoices/detail?userId=...&year=YYYY&month=M
+ * - fechada:    /api/invoices/detail?userId=...&invoiceId=123
+ * - retrocomp.: /api/invoices/detail?userId=...&year=YYYY&month=M  (vai buscar a MAIS RECENTE desse mês)
  */
 router.get("/invoices/detail", async (req, res) => {
   try {
     const userId = String(req.query.userId || "");
     const isCurrent = String(req.query.current || "") === "1";
+    const invoiceId = req.query.invoiceId ? Number(req.query.invoiceId) : undefined;
     const year = req.query.year ? Number(req.query.year) : undefined;
     const month = req.query.month ? Number(req.query.month) : undefined;
 
     if (!userId) return res.status(400).json({ error: "userId em falta" });
 
+    // ====== MODO "EM CURSO" (snapshot a partir dos miners) ======
     if (isCurrent) {
       const { year: y, month: m } = currentYearMonth();
-
-      const existing = await sql/*sql*/`
-        SELECT id
-        FROM energy_invoices
-        WHERE user_id = ${userId} AND year = ${y} AND month = ${m}
-        LIMIT 1
-      `;
-      const existingId = existing.length ? Number(existing[0].id) : undefined;
 
       const [currencyRow] = await sql/*sql*/`
         SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
@@ -123,7 +118,7 @@ router.get("/invoices/detail", async (req, res) => {
         WHERE user_id = ${userId}
       `;
 
-      // ⬇️ agora traz também modelo e hash_rate e já ordena por worker_name
+      // Itens "em curso" – calculados a partir dos miners
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -143,21 +138,22 @@ router.get("/invoices/detail", async (req, res) => {
       `;
 
       const items = miners.map((r) => {
-        const hours = Number(r.hours_online) || 0;
+        const hours   = Number(r.hours_online) || 0;
         const consumo = Number(r.consumo_kw_hora) || 0;
-        const preco = Number(r.preco_kw) || 0;
-        const kwh = +(hours * consumo).toFixed(3);
-        const amount = +(kwh * preco).toFixed(2);
-        const worker = String(r.worker_name || "").trim() || null;
-        const modelo = String(r.modelo || "").trim() || null;
-        const hashRate = String(r.hash_rate || "").trim() || null;
+        const preco   = Number(r.preco_kw) || 0;
+        const kwh     = +(hours * consumo).toFixed(3);
+        const amount  = +(kwh * preco).toFixed(2);
+
+        const worker  = String(r.worker_name || "").trim() || null;
+        const modelo  = String(r.modelo || "").trim() || null;
+        const hashRt  = String(r.hash_rate || "").trim() || null;
 
         return {
           miner_id: r.id,
           miner_nome: String(r.miner_nome),
           worker_name: worker,
           modelo,
-          hash_rate: hashRate,
+          hash_rate: hashRt,
           hours_online: hours,
           kwh_used: kwh,
           consumo_kw_hora: consumo,
@@ -166,12 +162,13 @@ router.get("/invoices/detail", async (req, res) => {
         };
       });
 
-      const subtotal = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
-      const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used || 0), 0).toFixed(3);
+      const subtotal  = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
+      const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used  || 0), 0).toFixed(3);
 
       return res.json({
         header: {
-          invoice_id: existingId,
+          // em curso não tem invoice_id (só passa a ter após "fechar")
+          invoice_id: undefined,
           year: y,
           month: m,
           status: "em_curso",
@@ -183,22 +180,44 @@ router.get("/invoices/detail", async (req, res) => {
       });
     }
 
-    if (!year || !month) {
-      return res.status(400).json({ error: "year e month em falta" });
+    // ====== MODO "FECHADA" ======
+    let invRow;
+
+    if (invoiceId) {
+      // Sem ambiguidades: por ID
+      const rows = await sql/*sql*/`
+        SELECT id, year, month,
+               COALESCE(subtotal_amount,0) AS subtotal_amount,
+               COALESCE(status,'pendente') AS status,
+               COALESCE(currency_code,'USD') AS currency_code,
+               created_at
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND id = ${invoiceId}
+        LIMIT 1
+      `;
+      invRow = rows[0];
+      if (!invRow) return res.status(404).json({ error: "Fatura não encontrada" });
+    } else {
+      // Retrocompatibilidade: (year, month) -> escolhe a MAIS RECENTE
+      if (!year || !month) {
+        return res.status(400).json({ error: "year e month em falta" });
+      }
+      const rows = await sql/*sql*/`
+        SELECT id, year, month,
+               COALESCE(subtotal_amount,0) AS subtotal_amount,
+               COALESCE(status,'pendente') AS status,
+               COALESCE(currency_code,'USD') AS currency_code,
+               created_at
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `;
+      invRow = rows[0];
+      if (!invRow) return res.status(404).json({ error: "Fatura não encontrada" });
     }
 
-    const [inv] = await sql/*sql*/`
-      SELECT id, year, month,
-             COALESCE(subtotal_amount,0) AS subtotal_amount,
-             COALESCE(status,'pendente') AS status,
-             COALESCE(currency_code,'USD') AS currency_code
-      FROM energy_invoices
-      WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
-      LIMIT 1
-    `;
-    if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
-
-    // ⬇️ junta a tabela miners p/ worker_name, modelo e hash_rate e ordena por worker
+    // Itens da fatura + enriquecimento com dados atuais dos miners (worker/model/hash)
     const items = await sql/*sql*/`
       SELECT 
         eii.miner_id,
@@ -213,7 +232,7 @@ router.get("/invoices/detail", async (req, res) => {
         COALESCE(m.hash_rate, '')        AS hash_rate
       FROM energy_invoice_items eii
       LEFT JOIN miners m ON m.id = eii.miner_id
-      WHERE eii.invoice_id = ${inv.id}
+      WHERE eii.invoice_id = ${invRow.id}
       ORDER BY
         CASE WHEN NULLIF(m.worker_name,'') IS NULL THEN 1 ELSE 0 END,
         LOWER(COALESCE(NULLIF(m.worker_name,''), eii.miner_nome)),
@@ -224,13 +243,14 @@ router.get("/invoices/detail", async (req, res) => {
 
     return res.json({
       header: {
-        invoice_id: Number(inv.id),
-        year: Number(inv.year),
-        month: Number(inv.month),
-        status: String(inv.status),
-        subtotal_amount: Number(inv.subtotal_amount),
-        currency_code: String(inv.currency_code || "USD"),
+        invoice_id: Number(invRow.id),
+        year: Number(invRow.year),
+        month: Number(invRow.month),
+        status: String(invRow.status),
+        subtotal_amount: Number(invRow.subtotal_amount),
+        currency_code: String(invRow.currency_code || "USD"),
         total_kwh,
+        created_at: invRow.created_at, // útil para debugar/listagens
       },
       items: items.map((r) => ({
         miner_id: r.miner_id,
@@ -251,6 +271,7 @@ router.get("/invoices/detail", async (req, res) => {
   }
 });
 
+
 /**
  * POST /api/invoices/close-now
  */
@@ -261,68 +282,60 @@ router.post("/invoices/close-now", async (req, res) => {
 
     const { year, month } = currentYearMonth();
 
-    const [row] = await sql/*sql*/`
-      WITH next_seq AS (
-        SELECT COALESCE(MAX(seq), 0) + 1 AS seq
-        FROM energy_invoices
-        WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
-      ),
-      inv AS (
-        INSERT INTO energy_invoices
-          (user_id, year, month, seq, subtotal_amount, status, currency_code)
-        SELECT
-          ${userId}, ${year}, ${month},
-          (SELECT seq FROM next_seq),
-          0, 'pendente', 'USD'
-        RETURNING id, year, month, seq
-      ),
-      items AS (
-        INSERT INTO energy_invoice_items
-          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
-        SELECT
-          (SELECT id FROM inv)                                AS invoice_id,
-          m.id                                                AS miner_id,
-          COALESCE(m.nome, CONCAT('Miner#', m.id::text))      AS miner_nome,
-          COALESCE(m.total_horas_online, 0)                   AS hours_online,
-          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
-          COALESCE(m.preco_kw, 0)                             AS preco_kw,
-          COALESCE(m.consumo_kw_hora, 0)                      AS consumo_kw_hora,
-          ROUND(
-            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw, 0),
-            2
-          )                                                   AS amount_eur
-        FROM miners m
-        WHERE m.user_id = ${userId}
-        RETURNING amount_eur
-      ),
-      upd AS (
-        UPDATE energy_invoices ei
-        SET subtotal_amount = (SELECT COALESCE(SUM(amount_eur), 0) FROM items),
-            updated_at = NOW(),
-            status = 'pendente'
-        WHERE ei.id = (SELECT id FROM inv)
-        RETURNING ei.id, ei.subtotal_amount
-      ),
-      reset AS (
-        UPDATE miners
-        SET total_horas_online = 0
-        WHERE user_id = ${userId}
-        RETURNING 1
-      )
-      SELECT inv.id, inv.year, inv.month, inv.seq, upd.subtotal_amount
-      FROM inv
-      JOIN upd ON upd.id = inv.id;
+    // 1) criar SEM ON CONFLICT; created_at usa o default NOW()
+    const [inv] = await sql/*sql*/`
+      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
+      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
+      RETURNING id, created_at
+    `;
+    const invoiceId = Number(inv.id);
+
+    // 2) inserir itens a partir dos miners (lógica original)
+    await sql/*sql*/`
+      INSERT INTO energy_invoice_items
+        (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
+      SELECT
+        ${invoiceId}                                        AS invoice_id,
+        m.id                                                AS miner_id,
+        COALESCE(m.nome, CONCAT('Miner#', m.id::text))      AS miner_nome,
+        COALESCE(m.total_horas_online,0)                    AS hours_online,
+        ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
+        COALESCE(m.preco_kw,0)                              AS preco_kw,
+        COALESCE(m.consumo_kw_hora,0)                       AS consumo_kw_hora,
+        ROUND(
+          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
+          2
+        )                                                   AS amount_eur
+      FROM miners m
+      WHERE m.user_id = ${userId}
+    `;
+
+    // 3) atualizar subtotal
+    const [tot] = await sql/*sql*/`
+      UPDATE energy_invoices ei
+      SET subtotal_amount = COALESCE((
+            SELECT SUM(amount_eur) FROM energy_invoice_items WHERE invoice_id = ${invoiceId}
+          ), 0),
+          updated_at = NOW(),
+          status = 'pendente'
+      WHERE ei.id = ${invoiceId}
+      RETURNING subtotal_amount
+    `;
+
+    // 4) reset às horas para a próxima “em_curso”
+    await sql/*sql*/`
+      UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}
     `;
 
     return res.json({
       ok: true,
       invoice: {
-        id: Number(row.id),
+        id: invoiceId,
         year,
         month,
-        seq: Number(row.seq),
+        created_at: inv.created_at,
         status: "pendente",
-        subtotal_amount: Number(row.subtotal_amount),
+        subtotal_amount: Number(tot.subtotal_amount || 0),
       },
     });
   } catch (e) {
@@ -330,6 +343,7 @@ router.post("/invoices/close-now", async (req, res) => {
     return res.status(500).json({ error: "Erro ao fechar fatura" });
   }
 });
+
 
 
 

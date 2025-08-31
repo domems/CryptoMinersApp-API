@@ -261,39 +261,43 @@ router.post("/invoices/close-now", async (req, res) => {
 
     const { year, month } = currentYearMonth();
 
-    // IMPORTANTE: garante que NÃO existe UNIQUE (user_id, year, month) em energy_invoices
-    // senão a segunda fatura do mesmo mês vai falhar.
-
     const [row] = await sql/*sql*/`
-      WITH inv AS (
-        INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
-        VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
-        RETURNING id, year, month
+      WITH next_seq AS (
+        SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+        FROM energy_invoices
+        WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
+      ),
+      inv AS (
+        INSERT INTO energy_invoices
+          (user_id, year, month, seq, subtotal_amount, status, currency_code)
+        SELECT
+          ${userId}, ${year}, ${month},
+          (SELECT seq FROM next_seq),
+          0, 'pendente', 'USD'
+        RETURNING id, year, month, seq
       ),
       items AS (
         INSERT INTO energy_invoice_items
           (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
         SELECT
-          (SELECT id FROM inv)                       AS invoice_id,
-          m.id                                       AS miner_id,
-          COALESCE(m.nome, CONCAT('Miner#', m.id::text)) AS miner_nome,
-          COALESCE(m.total_horas_online, 0)          AS hours_online,
+          (SELECT id FROM inv)                                AS invoice_id,
+          m.id                                                AS miner_id,
+          COALESCE(m.nome, CONCAT('Miner#', m.id::text))      AS miner_nome,
+          COALESCE(m.total_horas_online, 0)                   AS hours_online,
           ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
-          COALESCE(m.preco_kw, 0)                    AS preco_kw,
-          COALESCE(m.consumo_kw_hora, 0)             AS consumo_kw_hora,
+          COALESCE(m.preco_kw, 0)                             AS preco_kw,
+          COALESCE(m.consumo_kw_hora, 0)                      AS consumo_kw_hora,
           ROUND(
-            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3)
-            * COALESCE(m.preco_kw, 0), 2
-          )                                          AS amount_eur
+            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw, 0),
+            2
+          )                                                   AS amount_eur
         FROM miners m
         WHERE m.user_id = ${userId}
         RETURNING amount_eur
       ),
       upd AS (
         UPDATE energy_invoices ei
-        SET subtotal_amount = (
-              SELECT COALESCE(SUM(amount_eur), 0) FROM items
-            ),
+        SET subtotal_amount = (SELECT COALESCE(SUM(amount_eur), 0) FROM items),
             updated_at = NOW(),
             status = 'pendente'
         WHERE ei.id = (SELECT id FROM inv)
@@ -305,7 +309,7 @@ router.post("/invoices/close-now", async (req, res) => {
         WHERE user_id = ${userId}
         RETURNING 1
       )
-      SELECT inv.id, inv.year, inv.month, upd.subtotal_amount
+      SELECT inv.id, inv.year, inv.month, inv.seq, upd.subtotal_amount
       FROM inv
       JOIN upd ON upd.id = inv.id;
     `;
@@ -316,6 +320,7 @@ router.post("/invoices/close-now", async (req, res) => {
         id: Number(row.id),
         year,
         month,
+        seq: Number(row.seq),
         status: "pendente",
         subtotal_amount: Number(row.subtotal_amount),
       },

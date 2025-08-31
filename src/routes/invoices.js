@@ -292,32 +292,41 @@ router.post("/invoices/close-now", async (req, res) => {
 
   try {
     const rows = await sql/*sql*/`
-      WITH inv AS (
+      WITH miner_src AS (
+        SELECT
+          m.id                                        AS miner_id,
+          COALESCE(m.nome, CONCAT('Miner#', m.id::text)) AS miner_nome,
+          COALESCE(m.total_horas_online, 0)::numeric  AS hours_online,
+          COALESCE(m.consumo_kw_hora, 0)::numeric     AS consumo_kw_hora,
+          COALESCE(m.preco_kw, 0)::numeric            AS preco_kw,
+          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
+          ROUND(
+            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
+            2
+          )                                           AS amount_eur
+        FROM miners m
+        WHERE m.user_id = ${userId}
+      ),
+      inv AS (
         INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
         VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
         RETURNING id, year, month, created_at
       ),
-      items AS (
+      ins AS (
         INSERT INTO energy_invoice_items
           (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
         SELECT
           (SELECT id FROM inv),
-          m.id,
-          COALESCE(m.nome, CONCAT('Miner#', m.id::text)),
-          COALESCE(m.total_horas_online,0),
-          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3),
-          COALESCE(m.preco_kw,0),
-          COALESCE(m.consumo_kw_hora,0),
-          ROUND(
-            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
-            2
-          )
-        FROM miners m
-        WHERE m.user_id = ${userId}
-        RETURNING amount_eur
+          s.miner_id, s.miner_nome, s.hours_online, s.kwh_used,
+          s.preco_kw, s.consumo_kw_hora, s.amount_eur
+        FROM miner_src s
+        RETURNING 1
       ),
       agg AS (
-        SELECT COALESCE(SUM(amount_eur), 0) AS subtotal FROM items
+        SELECT
+          COUNT(*)::int                            AS items_count,
+          COALESCE(SUM(amount_eur), 0)::numeric   AS subtotal
+        FROM miner_src
       ),
       upd AS (
         UPDATE energy_invoices ei
@@ -325,27 +334,33 @@ router.post("/invoices/close-now", async (req, res) => {
             updated_at = NOW(),
             status = 'pendente'
         WHERE ei.id = (SELECT id FROM inv)
-        RETURNING ei.id, ei.subtotal_amount
-      ),
-      final AS (
-        SELECT
-          inv.id,
-          inv.year,
-          inv.month,
-          COALESCE(upd.subtotal_amount, (SELECT subtotal FROM agg), 0) AS subtotal_amount
-        FROM inv
-        LEFT JOIN upd ON upd.id = inv.id
+        RETURNING ei.id
       )
-      SELECT * FROM final;
+      SELECT
+        (SELECT id FROM inv)          AS id,
+        (SELECT items_count FROM agg) AS items_count,
+        (SELECT subtotal FROM agg)    AS subtotal_amount;
     `;
 
     const row = rows?.[0];
     if (!row) {
-      console.error("[POST] /invoices/close-now EMPTY_RESULT (inv/agg/upd não retornou)");
+      console.error("[POST] /invoices/close-now EMPTY_RESULT");
       return res.status(500).json({ error: "Erro inesperado ao fechar fatura (sem retorno)." });
     }
 
-    console.log("[POST] /invoices/close-now OK", row);
+    // reset depois de copiar
+    await sql/*sql*/`
+      UPDATE miners
+      SET total_horas_online = 0
+      WHERE user_id = ${userId}
+    `;
+
+    console.log("[POST] /invoices/close-now OK", {
+      id: row.id,
+      items_count: row.items_count,
+      subtotal: row.subtotal_amount
+    });
+
     return res.json({
       ok: true,
       invoice: {
@@ -353,19 +368,19 @@ router.post("/invoices/close-now", async (req, res) => {
         year,
         month,
         status: "pendente",
-        subtotal_amount: Number(row.subtotal_amount),
+        items_count: Number(row.items_count || 0),
+        subtotal_amount: Number(row.subtotal_amount || 0),
       },
     });
   } catch (e) {
     console.error("[POST] /invoices/close-now ERROR", {
-      code: e?.code,
-      detail: e?.detail,
-      message: e?.message,
+      code: e?.code, detail: e?.detail, message: e?.message,
     });
     const msg = e?.detail || e?.message || "Erro ao fechar fatura";
     return res.status(500).json({ error: msg });
   }
 });
+
 
 
 /**

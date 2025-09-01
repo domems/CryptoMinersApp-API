@@ -47,7 +47,7 @@ app.use("/api", adminInvoicesRouter);
 app.use("/api/auth", authRouter);
 
 // ---- rotas ADMIN (protegidas por role) ----
-app.use("/api/admin", ...adminOnly, minersAdminRoutes);
+app.use("/api", ...adminOnly, minersAdminRoutes);
 
 // raiz
 app.get("/", (_req, res) => {

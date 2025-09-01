@@ -10,15 +10,13 @@ import {
 
 const router = Router();
 
-// Saude/diagnóstico (usado pelo frontend p/ autodetectar o prefixo)
 router.get("/ping", ping);
-
-// Listagens
-router.get("/miners-all", listarTodasAsMiners);
 router.get("/miners-by-email", listarMinersPorEmail);
-
-// Status (batch e por id)
+router.get("/miners", listarTodasAsMiners);
 router.get("/miners-status", obterStatusBatch);
 router.get("/miners/:id/status", obterStatusPorId);
+router.get("/miners/:id", obterMinerPorId);
+router.patch("/miners/:id", patchMinerPorId);
+router.put("/miners/:id", patchMinerPorId);
 
 export default router;

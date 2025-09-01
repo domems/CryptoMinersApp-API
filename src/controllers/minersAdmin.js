@@ -2,13 +2,6 @@
 import { sql } from "../config/db.js";
 import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
-const adminEmails = ["domems@gmail.com", "admin2@email.com"];
-
-function isAdminReq(req) {
-  const requesterEmail = (req.header("x-user-email") || "").toLowerCase();
-  return adminEmails.includes(requesterEmail);
-}
-
 function parsePaging(req) {
   const page = Math.max(1, Number(req.query.page || 1));
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || req.query.limit || 10)));
@@ -23,12 +16,10 @@ function parseCoin(req) {
   return coin === "BTC" || coin === "LTC" ? coin : null;
 }
 
+const ORDER_BY_RECENTE = sql`COALESCE(created_at, data_registo, CURRENT_TIMESTAMP) DESC`;
+
 export async function listarMinersPorEmail(req, res) {
   try {
-    if (!isAdminReq(req)) {
-      return res.status(403).json({ error: "Acesso negado. Apenas admins." });
-    }
-
     const email = String(req.query.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Parâmetro 'email' é obrigatório." });
 
@@ -36,7 +27,6 @@ export async function listarMinersPorEmail(req, res) {
     const { page, pageSize, offset, limit } = parsePaging(req);
 
     const userId = await resolveUserIdByEmail(email);
-
     const whereCoin = coin ? sql`AND UPPER(coin) = ${coin}` : sql``;
 
     const [items, totalRow] = await Promise.all([
@@ -45,7 +35,7 @@ export async function listarMinersPorEmail(req, res) {
         FROM miners
         WHERE user_id = ${userId}
         ${whereCoin}
-        ORDER BY created_at DESC
+        ORDER BY ${ORDER_BY_RECENTE}
         LIMIT ${limit} OFFSET ${offset}
       `,
       sql`
@@ -71,10 +61,6 @@ export async function listarMinersPorEmail(req, res) {
 
 export async function listarTodasAsMiners(req, res) {
   try {
-    if (!isAdminReq(req)) {
-      return res.status(403).json({ error: "Acesso negado. Apenas admins." });
-    }
-
     const coin = parseCoin(req);
     const { page, pageSize, offset, limit } = parsePaging(req);
 
@@ -85,7 +71,7 @@ export async function listarTodasAsMiners(req, res) {
         SELECT *
         FROM miners
         ${whereCoin}
-        ORDER BY created_at DESC
+        ORDER BY ${ORDER_BY_RECENTE}
         LIMIT ${limit} OFFSET ${offset}
       `,
       sql`

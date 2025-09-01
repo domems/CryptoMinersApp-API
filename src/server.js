@@ -38,7 +38,7 @@ app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
-app.use("/api", adminInvoicesRouter);
+app.use("/api/admin", adminOnly, adminInvoicesRouter);
 
 // bootstrap de roles
 app.use("/api/auth", authRouter);

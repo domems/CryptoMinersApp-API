@@ -94,20 +94,33 @@ export async function listarTodasAsMiners(req, res) {
 
 export async function obterStatusBatch(req, res) {
   try {
-    const ids = parseIdList(req);
+    // ids=1,2,3 → [1,2,3]
+    const raw = String(req.query.ids || "").trim();
+    const ids = raw
+      ? raw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite)
+      : [];
+
     if (!ids.length) return res.json([]);
-    const rows = await sql`
+
+    // ⚠️ Em Neon usa-se sql.unsafe para listas dinâmicas
+    const rows = await sql.unsafe(
+      `
       SELECT id, COALESCE(status, 'offline') AS status
       FROM miners
-      WHERE id = ANY(${sql.array(ids, "int4")})
+      WHERE id = ANY($1::int[])
       ORDER BY id ASC
-    `;
-    res.json(rows.map((r) => ({ id: r.id, status: r.status })));
+      `,
+      [ids]
+    );
+
+    return res.json(rows.map((r) => ({ id: r.id, status: r.status })));
   } catch (err) {
     console.error("obterStatusBatch:", err);
-    res.status(err?.status || 500).json({ error: err.message || "Erro ao obter status (batch)." });
+    const status = err?.status || 500;
+    return res.status(status).json({ error: err.message || "Erro ao obter status (batch)." });
   }
 }
+
 
 export async function obterStatusPorId(req, res) {
   try {

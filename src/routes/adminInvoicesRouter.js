@@ -1,18 +1,18 @@
-// backend/routes/adminInvoicesRouter.js
 import express from "express";
 import { sql } from "../config/db.js";
-import { assertAdminFromHeader, resolveUserIdByEmail } from "../utils/admin-helpers.js";
+import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
 const router = express.Router();
+
+/** Opcional: health para autodetecção no frontend */
+router.get("/ping", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 /**
  * GET /api/admin/invoices-feed?limit=10&offset=0&status=...
  * Lista global paginada (sem email). Não inclui linha "em_curso".
  */
-router.get("/admin/invoices-feed", async (req, res) => {
+router.get("/invoices-feed", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
-
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || "10"), 10) || 10, 1), 50); // 1..50
     const offset = Math.max(parseInt(String(req.query.offset || "0"), 10) || 0, 0);
 
@@ -20,7 +20,6 @@ router.get("/admin/invoices-feed", async (req, res) => {
     const allowed = new Set(["em_curso", "pendente", "aguarda_pagamento", "fechada", "pago"]);
     if (!allowed.has(status)) status = ""; // ignora inválidos
 
-    // monta WHERE dinamicamente
     const where = status ? sql`WHERE status = ${status}` : sql``;
 
     const items = await sql/*sql*/`
@@ -44,7 +43,6 @@ router.get("/admin/invoices-feed", async (req, res) => {
       currency_code: String(r.currency_code || "USD"),
     }));
 
-    // determina hasMore com uma “espreitadela” simples
     const nextOffset = offset + mapped.length;
     const hasMore = mapped.length === limit;
 
@@ -59,50 +57,45 @@ router.get("/admin/invoices-feed", async (req, res) => {
  * GET /api/admin/invoices-by-email?email=...&status=...
  * Lista faturas do cliente por email (inclui linha "em_curso" se status for vazio ou 'em_curso')
  */
-router.get("/admin/invoices-by-email", async (req, res) => {
+router.get("/invoices-by-email", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
     const email = String(req.query.email || "").trim().toLowerCase();
     let status = String(req.query.status || "").trim().toLowerCase();
 
     if (!email) {
-      // sem email → delega para o feed global (primeira página por conveniência)
-      req.query.limit = req.query.limit || "10";
-      req.query.offset = req.query.offset || "0";
-      return router.handle(req, res); // cai no handler certo acima
+      // Sem email: o frontend já chama /invoices-feed; evita encadeamentos aqui
+      return res.status(400).json({ error: "Parâmetro 'email' é obrigatório." });
     }
 
     const allowed = new Set(["em_curso", "pendente", "aguarda_pagamento", "fechada", "pago"]);
     if (!allowed.has(status)) status = ""; // ignora inválidos
 
-    const userId = await resolveUserIdByEmail(email);
+    const userId = await resolveUserIdByEmail(email).catch(() => null);
     if (!userId) return res.json([]);
 
-    // Faturas guardadas (filtradas por status se aplicável e != em_curso)
-    let saved;
-    if (status && status !== "em_curso") {
-      saved = await sql/*sql*/`
-        SELECT id, user_id, year, month,
-               COALESCE(subtotal_amount,0) AS subtotal_amount,
-               COALESCE(status,'pendente') AS status,
-               COALESCE(currency_code,'USD') AS currency_code
-        FROM energy_invoices
-        WHERE user_id = ${userId} AND status = ${status}
-        ORDER BY year DESC, month DESC
-      `;
-    } else {
-      saved = await sql/*sql*/`
-        SELECT id, user_id, year, month,
-               COALESCE(subtotal_amount,0) AS subtotal_amount,
-               COALESCE(status,'pendente') AS status,
-               COALESCE(currency_code,'USD') AS currency_code
-        FROM energy_invoices
-        WHERE user_id = ${userId}
-        ORDER BY year DESC, month DESC
-      `;
-    }
+    // faturas guardadas
+    const saved =
+      status && status !== "em_curso"
+        ? await sql/*sql*/`
+            SELECT id, user_id, year, month,
+                   COALESCE(subtotal_amount,0) AS subtotal_amount,
+                   COALESCE(status,'pendente') AS status,
+                   COALESCE(currency_code,'USD') AS currency_code
+            FROM energy_invoices
+            WHERE user_id = ${userId} AND status = ${status}
+            ORDER BY year DESC, month DESC
+          `
+        : await sql/*sql*/`
+            SELECT id, user_id, year, month,
+                   COALESCE(subtotal_amount,0) AS subtotal_amount,
+                   COALESCE(status,'pendente') AS status,
+                   COALESCE(currency_code,'USD') AS currency_code
+            FROM energy_invoices
+            WHERE user_id = ${userId}
+            ORDER BY year DESC, month DESC
+          `;
 
-    // Fatura em curso (on-the-fly)
+    // linha "em_curso"
     const now = new Date();
     const y = now.getFullYear();
     const m = now.getMonth() + 1;
@@ -120,7 +113,7 @@ router.get("/admin/invoices-by-email", async (req, res) => {
       const hours = Number(r.hours_online) || 0;
       const consumo = Number(r.consumo_kw_hora) || 0;
       const preco = Number(r.preco_kw) || 0;
-      return acc + (hours * consumo * preco);
+      return acc + hours * consumo * preco;
     }, 0).toFixed(2);
 
     const currencyRow = await sql/*sql*/`
@@ -162,13 +155,12 @@ router.get("/admin/invoices-by-email", async (req, res) => {
 /**
  * POST /api/admin/invoices/close-now
  */
-router.post("/admin/invoices/close-now", async (req, res) => {
+router.post("/invoices/close-now", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "email em falta" });
 
-    const userId = await resolveUserIdByEmail(email);
+    const userId = await resolveUserIdByEmail(email).catch(() => null);
     if (!userId) return res.status(404).json({ error: "Utilizador não encontrado" });
 
     const now = new Date();
@@ -178,10 +170,10 @@ router.post("/admin/invoices/close-now", async (req, res) => {
     const miners = await sql/*sql*/`
       SELECT
         id,
-        COALESCE(nome, CONCAT('Miner#', id::text)) AS miner_nome,
-        COALESCE(total_horas_online,0)             AS hours_online,
-        COALESCE(consumo_kw_hora,0)                AS consumo_kw_hora,
-        COALESCE(preco_kw,0)                       AS preco_kw
+        COALESCE(nome, 'Miner#' || id::text)      AS miner_nome,
+        COALESCE(total_horas_online,0)            AS hours_online,
+        COALESCE(consumo_kw_hora,0)               AS consumo_kw_hora,
+        COALESCE(preco_kw,0)                      AS preco_kw
       FROM miners
       WHERE user_id = ${userId}
       ORDER BY id ASC
@@ -233,7 +225,7 @@ router.post("/admin/invoices/close-now", async (req, res) => {
       WHERE user_id = ${userId}
     `;
 
-    return res.json({
+    res.json({
       ok: true,
       invoice: {
         id: invoiceId,
@@ -252,9 +244,8 @@ router.post("/admin/invoices/close-now", async (req, res) => {
 /**
  * GET /api/admin/invoices/:id
  */
-router.get("/admin/invoices/:id", async (req, res) => {
+router.get("/invoices/:id", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: "id inválido" });
 
@@ -289,9 +280,8 @@ router.get("/admin/invoices/:id", async (req, res) => {
 /**
  * PATCH /api/admin/invoices/:id
  */
-router.patch("/admin/invoices/:id", async (req, res) => {
+router.patch("/invoices/:id", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: "id inválido" });
 
@@ -318,9 +308,8 @@ router.patch("/admin/invoices/:id", async (req, res) => {
 /**
  * DELETE /api/admin/invoices/:id
  */
-router.delete("/admin/invoices/:id", async (req, res) => {
+router.delete("/invoices/:id", async (req, res) => {
   try {
-    await assertAdminFromHeader(req);
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: "id inválido" });
 

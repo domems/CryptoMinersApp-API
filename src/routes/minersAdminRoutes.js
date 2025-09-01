@@ -6,6 +6,8 @@ import {
   listarTodasAsMiners,
   obterStatusBatch,
   obterStatusPorId,
+  obterMinerPorId,
+  patchMinerPorId,
 } from "../controllers/minersAdmin.js";
 
 const router = Router();

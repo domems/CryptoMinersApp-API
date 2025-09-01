@@ -13,6 +13,11 @@ import paymentsRoutes from "./routes/payments.js";
 import minersAdminRoutes from "./routes/minersAdminRoutes.js";
 import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
 
+// ⬇️ NOVOS imports
+import { clerkMiddleware } from "@clerk/express";
+import authRouter from "./routes/auth.js";
+import { adminOnly } from "./middleware/adminOnly.js";
+
 dotenv.config();
 
 const PORT = process.env.PORT || 5001;
@@ -21,19 +26,27 @@ const app = express();
 // ❗ raw body só para o webhook do NOWPayments (antes do express.json)
 app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
 
-// middleware
+// Clerk middleware (popula req.auth) — NÃO exige login por si só
+app.use(clerkMiddleware());
+
+// middleware gerais
 app.use(rateLimiter);
 app.use(express.json());
 
-// monta as rotas
+// ---- rotas públicas/gerais ----
 app.use("/api/clerk", clerkRoutes);
 app.use("/api/miners", minerRoutes);
 app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
-app.use("/api/admin", minersAdminRoutes);
 app.use("/api", adminInvoicesRouter);
+
+// ⬇️ rota para bootstrap de roles (usada pelo app após login/signup)
+app.use("/auth", authRouter);
+
+// ---- rotas ADMIN (protegidas por role) ----
+app.use("/api/admin", ...adminOnly, minersAdminRoutes);
 
 // raiz
 app.get("/", (_req, res) => {
@@ -45,7 +58,6 @@ console.log("my port:", process.env.PORT);
 // Cria/atualiza tabelas
 async function initDB() {
   try {
-    // Tabela base (se não existir)
     await sql/*sql*/`
       CREATE TABLE IF NOT EXISTS miners (
         id SERIAL PRIMARY KEY,
@@ -57,7 +69,6 @@ async function initDB() {
         data_registo TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `;
-
     console.log("✅ DB pronta (tabelas e colunas verificadas).");
   } catch (err) {
     console.error("❌ Erro ao preparar a DB:", err);
@@ -68,7 +79,7 @@ async function initDB() {
 // arranque
 initDB().then(() => {
   app.listen(PORT, () => {
-    startAllJobs(); 
+    startAllJobs();
     console.log("Server is up and running at port", PORT);
   });
 });

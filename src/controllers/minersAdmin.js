@@ -116,22 +116,29 @@ export async function listarTodasAsMiners(req, res) {
  * ========================= */
 export async function obterStatusBatch(req, res) {
   try {
+    // ids=1,2,3 → [1,2,3]
     const raw = String(req.query.ids || "").trim();
     const ids = raw ? raw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite) : [];
     if (!ids.length) return res.json([]);
 
-    // Neon: usar sql.unsafe para arrays dinâmicas
-    const rows = await sql.unsafe(
+    // evita abusos
+    const MAX_IDS = 500;
+    const idsCapped = ids.slice(0, MAX_IDS);
+
+    const result = await sql.unsafe(
       `
       SELECT id, COALESCE(status, 'offline') AS status
       FROM miners
       WHERE id = ANY($1::int[])
       ORDER BY id ASC
       `,
-      [ids]
+      [idsCapped]
     );
 
-    return res.json(rows.map((r) => ({ id: r.id, status: r.status })));
+    // normaliza para array de linhas
+    const rows = Array.isArray(result) ? result : Array.isArray(result?.rows) ? result.rows : [];
+
+    return res.json(rows.map((r) => ({ id: Number(r.id), status: String(r.status) })));
   } catch (err) {
     console.error("obterStatusBatch:", err);
     const status = err?.status || 500;
@@ -254,7 +261,8 @@ export async function patchMinerPorId(req, res) {
       WHERE id = $${params.length + 1}
       RETURNING *
     `;
-    const rows = await sql.unsafe(q, [...params, id]);
+    const updated = await sql.unsafe(q, [...params, id]);
+    const rows = Array.isArray(updated) ? updated : Array.isArray(updated?.rows) ? updated.rows : [];
     if (!rows?.length) return res.status(404).json({ error: "Miner não encontrada." });
 
     res.json({ ok: true, miner: rows[0] });

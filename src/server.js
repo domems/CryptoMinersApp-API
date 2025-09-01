@@ -23,11 +23,12 @@ dotenv.config();
 const PORT = process.env.PORT || 5001;
 const app = express();
 
+app.use(clerkMiddleware());
 // ❗ raw body só para o webhook do NOWPayments (antes do express.json)
 app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
 
 // Clerk middleware (popula req.auth) — NÃO exige login por si só
-app.use(clerkMiddleware());
+
 
 // middleware gerais
 app.use(rateLimiter);
@@ -43,7 +44,7 @@ app.use("/api", paymentsRoutes);
 app.use("/api", adminInvoicesRouter);
 
 // ⬇️ rota para bootstrap de roles (usada pelo app após login/signup)
-app.use("/auth", authRouter);
+app.use("/api/auth", authRouter);
 
 // ---- rotas ADMIN (protegidas por role) ----
 app.use("/api/admin", ...adminOnly, minersAdminRoutes);

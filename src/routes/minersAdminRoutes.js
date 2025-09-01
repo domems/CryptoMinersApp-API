@@ -1,20 +1,24 @@
-// routes/minersAdminRoutes.js
-import express from "express";
-import { requireAdmin } from "../middleware/requireAdmin.js";
+// src/routes/admin.js
+import { Router } from "express";
 import {
+  ping,
   listarMinersPorEmail,
   listarTodasAsMiners,
+  obterStatusBatch,
+  obterStatusPorId,
 } from "../controllers/minersAdmin.js";
 
-const router = express.Router();
+const router = Router();
 
-// health/diagnóstico da proteção
-router.get("/admin/ping", requireAdmin, (_req, res) => res.json({ ok: true }));
+// Saude/diagnóstico (usado pelo frontend p/ autodetectar o prefixo)
+router.get("/ping", ping);
 
 // Listagens
-router.get("/admin/miners-by-email", requireAdmin, listarMinersPorEmail);
-router.get("/admin/miners", requireAdmin, listarTodasAsMiners);
-// alias compat
-router.get("/admin/miners-all", requireAdmin, listarTodasAsMiners);
+router.get("/miners-all", listarTodasAsMiners);
+router.get("/miners-by-email", listarMinersPorEmail);
+
+// Status (batch e por id)
+router.get("/miners-status", obterStatusBatch);
+router.get("/miners/:id/status", obterStatusPorId);
 
 export default router;

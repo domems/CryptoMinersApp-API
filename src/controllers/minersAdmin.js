@@ -36,13 +36,9 @@ function normalizeDecimal(v) {
 
 const ORDER_BY_RECENTE = sql`COALESCE(created_at, CURRENT_TIMESTAMP) DESC, id DESC`;
 
-/** WHERE flexível por id (aceita inteiro ou texto/uuid) */
+/** WHERE por id — sempre como texto, funciona p/ SERIAL e UUID */
 function whereById(idParam) {
   const idStr = String(idParam ?? "").trim();
-  const idNum = Number(idStr);
-  if (Number.isInteger(idNum)) {
-    return sql`id = ${idNum}`;
-  }
   return sql`id::text = ${idStr}`;
 }
 
@@ -126,7 +122,6 @@ export async function listarTodasAsMiners(req, res) {
  * ========================= */
 export async function obterStatusBatch(req, res) {
   try {
-    // ids=1,2,3 → [1,2,3]
     const raw = String(req.query.ids || "").trim();
     const ids = raw ? raw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite) : [];
     if (!ids.length) return res.json([]);
@@ -195,12 +190,8 @@ export async function obterMinerPorId(req, res) {
 // PATCH/PUT /api/admin/miners/:id — atualização parcial e validada
 export async function patchMinerPorId(req, res) {
   try {
-    // 1) Verifica existência
-    const where = whereById(req.params.id);
-    const exists = await sql/*sql*/`SELECT 1 FROM miners WHERE ${where} LIMIT 1`;
-    if (!exists.length) return res.status(404).json({ error: "Miner não encontrada." });
+    const idText = String(req.params.id ?? "").trim();
 
-    // 2) Normaliza inputs
     const body = req.body || {};
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
     const pickStr = (k) => {
@@ -236,14 +227,9 @@ export async function patchMinerPorId(req, res) {
       pool = P;
     }
 
-    // 3) Monta SET dinâmico com placeholders
     const sets = [];
     const params = [];
-
-    const add = (col, val) => {
-      sets.push(`${col} = $${params.length + 1}`);
-      params.push(val);
-    };
+    const add = (col, val) => { sets.push(`${col} = $${params.length + 1}`); params.push(val); };
 
     if (nome !== undefined) add("nome", nome);
     if (modelo !== undefined) add("modelo", modelo);
@@ -259,23 +245,27 @@ export async function patchMinerPorId(req, res) {
       return res.status(400).json({ error: "Nada para atualizar." });
     }
 
-    // 4) WHERE flexível também em unsafe
-    const idStr = String(req.params.id ?? "").trim();
-    const idNum = Number(idStr);
-    const whereClause =
-      Number.isInteger(idNum) ? `id = $${params.length + 1}` : `id::text = $${params.length + 1}`;
-    const whereValue = Number.isInteger(idNum) ? idNum : idStr;
-
+    // WHERE sempre como texto — cobre SERIAL e UUID
     const query = `
       UPDATE miners
       SET ${sets.join(", ")}
-      WHERE ${whereClause}
+      WHERE id::text = $${params.length + 1}
       RETURNING *
     `;
+    const args = [...params, idText];
 
-    const updated = await sql.unsafe(query, [...params, whereValue]);
+    if (process.env.DEBUG_SQL === "1") {
+      console.log("[patchMinerPorId] id =", idText, "SETS =", sets, "ARGS LEN =", args.length);
+    }
+
+    const updated = await sql.unsafe(query, args);
     const rows = Array.isArray(updated) ? updated : Array.isArray(updated?.rows) ? updated.rows : [];
-    if (!rows?.length) return res.status(404).json({ error: "Miner não encontrada." });
+    if (!rows?.length) {
+      if (process.env.DEBUG_SQL === "1") {
+        console.log("[patchMinerPorId] 0 rows RETURNING para id =", idText);
+      }
+      return res.status(404).json({ error: "Miner não encontrada." });
+    }
 
     res.json({ ok: true, miner: rows[0] });
   } catch (err) {

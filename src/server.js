@@ -45,7 +45,7 @@ app.use("/api/auth", authRouter);
 
 // ---- rotas ADMIN (protegidas) ----
 // ✅ monta em /api/admin (um único /admin no caminho)
-app.use("/api", adminOnly, minersAdminRoutes);
+app.use("/api/admin", adminOnly, minersAdminRoutes);
 
 // raiz/health
 app.get("/", (_req, res) => res.send("Its working"));

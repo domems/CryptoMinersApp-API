@@ -36,6 +36,16 @@ function normalizeDecimal(v) {
 
 const ORDER_BY_RECENTE = sql`COALESCE(created_at, CURRENT_TIMESTAMP) DESC, id DESC`;
 
+/** WHERE flexível por id (aceita inteiro ou texto/uuid) */
+function whereById(idParam) {
+  const idStr = String(idParam ?? "").trim();
+  const idNum = Number(idStr);
+  if (Number.isInteger(idNum)) {
+    return sql`id = ${idNum}`;
+  }
+  return sql`id::text = ${idStr}`;
+}
+
 /* =========================
  * Health
  * ========================= */
@@ -121,7 +131,6 @@ export async function obterStatusBatch(req, res) {
     const ids = raw ? raw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite) : [];
     if (!ids.length) return res.json([]);
 
-    // evita abusos
     const MAX_IDS = 500;
     const idsCapped = ids.slice(0, MAX_IDS);
 
@@ -135,9 +144,7 @@ export async function obterStatusBatch(req, res) {
       [idsCapped]
     );
 
-    // normaliza para array de linhas
     const rows = Array.isArray(result) ? result : Array.isArray(result?.rows) ? result.rows : [];
-
     return res.json(rows.map((r) => ({ id: Number(r.id), status: String(r.status) })));
   } catch (err) {
     console.error("obterStatusBatch:", err);
@@ -148,13 +155,11 @@ export async function obterStatusBatch(req, res) {
 
 export async function obterStatusPorId(req, res) {
   try {
-    const id = parseInt(String(req.params.id || ""), 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
-
+    const where = whereById(req.params.id);
     const rows = await sql/*sql*/`
       SELECT id, COALESCE(status, 'offline') AS status
       FROM miners
-      WHERE id = ${id}
+      WHERE ${where}
       LIMIT 1
     `;
     if (!rows.length) return res.status(404).json({ error: "Miner não encontrada." });
@@ -172,13 +177,11 @@ export async function obterStatusPorId(req, res) {
 // GET /api/admin/miners/:id
 export async function obterMinerPorId(req, res) {
   try {
-    const id = parseInt(String(req.params.id || ""), 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
-
+    const where = whereById(req.params.id);
     const rows = await sql/*sql*/`
       SELECT *
       FROM miners
-      WHERE id = ${id}
+      WHERE ${where}
       LIMIT 1
     `;
     if (!rows.length) return res.status(404).json({ error: "Miner não encontrada." });
@@ -192,8 +195,11 @@ export async function obterMinerPorId(req, res) {
 // PATCH/PUT /api/admin/miners/:id — atualização parcial e validada
 export async function patchMinerPorId(req, res) {
   try {
-    const id = parseInt(String(req.params.id || ""), 10);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
+    const where = whereById(req.params.id);
+
+    // Garante que existe antes (evita 'não encontrada' por update a zero linhas por engano)
+    const exists = await sql/*sql*/`SELECT 1 FROM miners WHERE ${where} LIMIT 1`;
+    if (!exists.length) return res.status(404).json({ error: "Miner não encontrada." });
 
     const body = req.body || {};
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
@@ -233,39 +239,31 @@ export async function patchMinerPorId(req, res) {
       pool = P;
     }
 
-    // construir SET dinâmico parametrizado
+    // Construir SET dinâmico (parametrizado com template tag do driver)
     const sets = [];
-    const params = [];
-    const addSet = (column, value) => {
-      sets.push(`${column} = $${params.length + 1}`);
-      params.push(value);
-    };
+    if (nome !== undefined) sets.push(sql`nome = ${nome}`);
+    if (modelo !== undefined) sets.push(sql`modelo = ${modelo}`);
+    if (hash_rate !== undefined) sets.push(sql`hash_rate = ${hash_rate}`);
+    if (preco_kw !== undefined) sets.push(sql`preco_kw = ${preco_kw}`);
+    if (consumo_kw_hora !== undefined) sets.push(sql`consumo_kw_hora = ${consumo_kw_hora}`);
+    if (worker_name !== undefined) sets.push(sql`worker_name = ${worker_name}`);
+    if (api_key !== undefined) sets.push(sql`api_key = ${api_key}`);
+    if (coin !== undefined) sets.push(sql`coin = ${coin}`);
+    if (pool !== undefined) sets.push(sql`pool = ${pool}`);
 
-    if (nome !== undefined) addSet("nome", nome);
-    if (modelo !== undefined) addSet("modelo", modelo);
-    if (hash_rate !== undefined) addSet("hash_rate", hash_rate);
-    if (preco_kw !== undefined) addSet("preco_kw", preco_kw);
-    if (consumo_kw_hora !== undefined) addSet("consumo_kw_hora", consumo_kw_hora);
-    if (worker_name !== undefined) addSet("worker_name", worker_name);
-    if (api_key !== undefined) addSet("api_key", api_key);
-    if (coin !== undefined) addSet("coin", coin);
-    if (pool !== undefined) addSet("pool", pool);
-
-    if (sets.length === 0) {
+    if (!sets.length) {
       return res.status(400).json({ error: "Nada para atualizar." });
     }
 
-    const q = `
+    const updated = await sql/*sql*/`
       UPDATE miners
-      SET ${sets.join(", ")}
-      WHERE id = $${params.length + 1}
+      SET ${sql.join(sets, sql`, `)}
+      WHERE ${where}
       RETURNING *
     `;
-    const updated = await sql.unsafe(q, [...params, id]);
-    const rows = Array.isArray(updated) ? updated : Array.isArray(updated?.rows) ? updated.rows : [];
-    if (!rows?.length) return res.status(404).json({ error: "Miner não encontrada." });
 
-    res.json({ ok: true, miner: rows[0] });
+    if (!updated?.length) return res.status(404).json({ error: "Miner não encontrada." });
+    res.json({ ok: true, miner: updated[0] });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });

@@ -186,17 +186,19 @@ export async function obterMinerPorId(req, res) {
 }
 
 // PATCH/PUT /api/admin/miners/:id
-// PATCH/PUT /api/admin/miners/:id — atualização parcial e validada
 export async function patchMinerPorId(req, res) {
   try {
     const id = parseInt(String(req.params.id || ""), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
 
-    // 1) Confirma existência (evita falsos 404 por RETURNING em libs diferentes)
-    const exists = await sql/*sql*/`
+    // --- Confirma existência (normaliza formato do driver) ---
+    const existsRes = await sql/*sql*/`
       SELECT id FROM miners WHERE id = ${id} LIMIT 1
     `;
-    if (!exists?.length) return res.status(404).json({ error: "Miner não encontrada." });
+    const existsRows = Array.isArray(existsRes) ? existsRes : (existsRes?.rows ?? []);
+    if (existsRows.length === 0) {
+      return res.status(404).json({ error: "Miner não encontrada." });
+    }
 
     const body = req.body || {};
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
@@ -217,7 +219,7 @@ export async function patchMinerPorId(req, res) {
     const worker_name = pickStr("worker_name");
     const api_key     = pickStr("api_key");
 
-    // números (NUMERIC)
+    // NUMERIC
     const normalizeDecimal = (v) => {
       if (v === undefined) return undefined;
       if (v === null || v === "") return null;
@@ -230,9 +232,14 @@ export async function patchMinerPorId(req, res) {
       const n = Number(s);
       return Number.isFinite(n) ? n : null;
     };
-    const hash_rate         = has("hash_rate")         ? (body.hash_rate == null ? null : String(body.hash_rate)) : undefined; // TEXT
-    const preco_kw          = has("preco_kw")          ? normalizeDecimal(body.preco_kw) : undefined;                            // NUMERIC
-    const consumo_kw_hora   = has("consumo_kw_hora")   ? normalizeDecimal(body.consumo_kw_hora) : undefined;                    // NUMERIC
+
+    // TEXT no DB
+    const hash_rate         = has("hash_rate")
+      ? (body.hash_rate == null ? null : String(body.hash_rate))
+      : undefined;
+
+    const preco_kw          = has("preco_kw")        ? normalizeDecimal(body.preco_kw)        : undefined;
+    const consumo_kw_hora   = has("consumo_kw_hora") ? normalizeDecimal(body.consumo_kw_hora) : undefined;
 
     // coin/pool com whitelist
     const COIN_WHITELIST = ["BTC","BCH","XEC","LTC","ETC","ZEC","DASH","CKB","HNS","KAS"];
@@ -254,45 +261,40 @@ export async function patchMinerPorId(req, res) {
       pool = P;
     }
 
-    // 2) Construir UPDATE dinâmico
+    // --- Construir UPDATE dinâmico parametrizado ---
     const sets = [];
     const params = [];
     const add = (col, val) => { sets.push(`${col} = $${params.length + 1}`); params.push(val); };
 
-    if (nome        !== undefined) add("nome", nome);
-    if (modelo      !== undefined) add("modelo", modelo);
-    if (hash_rate   !== undefined) add("hash_rate", hash_rate);               // TEXT (string|null)
-    if (preco_kw    !== undefined) add("preco_kw", preco_kw);                 // NUMERIC (number|null)
-    if (consumo_kw_hora !== undefined) add("consumo_kw_hora", consumo_kw_hora);
-    if (worker_name !== undefined) add("worker_name", worker_name);
-    if (api_key     !== undefined) add("api_key", api_key);
-    if (coin        !== undefined) add("coin", coin);
-    if (pool        !== undefined) add("pool", pool);
+    if (nome            !== undefined) add("nome", nome);
+    if (modelo          !== undefined) add("modelo", modelo);
+    if (hash_rate       !== undefined) add("hash_rate", hash_rate);               // TEXT
+    if (preco_kw        !== undefined) add("preco_kw", preco_kw);                 // NUMERIC
+    if (consumo_kw_hora !== undefined) add("consumo_kw_hora", consumo_kw_hora);   // NUMERIC
+    if (worker_name     !== undefined) add("worker_name", worker_name);
+    if (api_key         !== undefined) add("api_key", api_key);
+    if (coin            !== undefined) add("coin", coin);
+    if (pool            !== undefined) add("pool", pool);
 
-    if (!sets.length) {
+    if (sets.length === 0) {
       return res.status(400).json({ error: "Nada para atualizar." });
     }
 
-    // 3) Executa UPDATE (parametrizado) + SELECT final
+    // --- UPDATE + RETURNING (sem SELECT extra) ---
     const updateSQL = `
       UPDATE miners
       SET ${sets.join(", ")}
       WHERE id = $${params.length + 1}
+      RETURNING *
     `;
-    await sql.unsafe(updateSQL, [...params, id]);
+    const updRes = await sql.unsafe(updateSQL, [...params, id]);
+    const updRows = Array.isArray(updRes) ? updRes : (updRes?.rows ?? []);
 
-    const refreshed = await sql/*sql*/`
-      SELECT *
-      FROM miners
-      WHERE id = ${id}
-      LIMIT 1
-    `;
-    if (!refreshed?.length) {
-      // extremamente improvável, mas deixa 404 consistente
+    if (updRows.length === 0) {
       return res.status(404).json({ error: "Miner não encontrada." });
     }
 
-    return res.json({ ok: true, miner: refreshed[0] });
+    return res.json({ ok: true, miner: updRows[0] });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });

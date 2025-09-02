@@ -2,7 +2,7 @@
 import { sql } from "../config/db.js";
 import { resolveUserIdByEmail } from "../services/clerkUserService.js";
 
-// --- helpers (coloca no topo, substituindo a tua buildWhere) ---
+// --- helpers ---
 function parseBool(v) {
   if (v === undefined || v === null) return undefined;
   const s = String(v).trim().toLowerCase();
@@ -37,9 +37,41 @@ function buildFilters({ search, coin, exibicao }) {
     filters.push(sql`AND em_exibicao = ${exib}`);
   }
 
-  // concatena todos os fragmentos em segurança
   const filterSql = filters.reduce((acc, frag) => sql`${acc} ${frag}`, sql``);
   return { filterSql };
+}
+
+/** Conversor decimal robusto:
+ *  - aceita number direto (não mexe)
+ *  - aceita strings "3.57", "3,57", "1.234,56", "1,234.56"
+ *  - assume que o ÚLTIMO separador (.,) é o decimal e remove o restante como milhares
+ */
+export function parseDecimalFlexible(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+
+  let s = String(v).trim().replace(/\s+/g, "");
+  const hasComma = s.includes(",");
+  const hasDot = s.includes(".");
+
+  if (hasComma && hasDot) {
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    const decSep = lastComma > lastDot ? "," : ".";
+    const thouSep = decSep === "," ? "\\." : ",";
+    // remove milhares e troca decimal por ponto
+    s = s.replace(new RegExp(thouSep, "g"), "");
+    s = s.replace(decSep, ".");
+  } else if (hasComma) {
+    // "3,57" ou "1,234" -> supomos vírgula decimal; remove pontos só se existirem (milhares)
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    // só dígitos e/ou ponto -> já está OK
+    // NÃO remover o ponto decimal!
+  }
+
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
 /** GET /api/store-miners?q=&search=&coin=&exibicao=true&limit=10&offset=0 */
@@ -50,9 +82,7 @@ export async function getStoreMiners(req, res) {
     const _limit = Math.min(Number(limit) || 10, 50);
     const _offset = Math.max(Number(offset) || 0, 0);
 
-    // usa q ou search (ambos funcionam)
     const searchParam = (typeof q === "string" && q.length ? q : search) || "";
-
     const { filterSql } = buildFilters({ search: searchParam, coin, exibicao });
 
     const rows = await sql`
@@ -99,18 +129,13 @@ export async function createStoreMiner(req, res) {
       em_exibicao,
     } = req.body;
 
-    // Obrigatórios mínimos p/ tua tabela
     if (!nome || !modelo || consumo_kw == null || preco == null) {
       return res
         .status(400)
         .json({ error: "Preencha Nome, Modelo, Consumo kW e Preço." });
     }
 
-    // Números
-    const toNum = (v) =>
-      v === null || v === undefined || v === ""
-        ? null
-        : Number(String(v).replace(",", "."));
+    const toNum = (v) => (v === null || v === undefined || v === "" ? null : parseDecimalFlexible(v));
     const consumo = toNum(consumo_kw);
     const price = toNum(preco);
     const qnt = Number(quantidade ?? 1);
@@ -121,7 +146,6 @@ export async function createStoreMiner(req, res) {
         .json({ error: "Consumo kW e Preço devem ser números válidos." });
     }
 
-    // Default de coin se não vier: 'BTC'
     const coinSafe =
       (typeof coin === "string" && coin.trim() && coin.trim().toUpperCase()) ||
       "BTC";
@@ -159,7 +183,7 @@ export async function updateStoreMiner(req, res) {
       quantidade,
       descricao,
       imagem_url,
-      coin, // pode não vir: se não vier, mantém o valor existente
+      coin,
       em_exibicao,
     } = req.body;
 
@@ -169,15 +193,11 @@ export async function updateStoreMiner(req, res) {
         .json({ error: "Preencha Nome, Modelo, Consumo kW e Preço." });
     }
 
-    const toNum = (v) =>
-      v === null || v === undefined || v === ""
-        ? null
-        : Number(String(v).replace(",", "."));
+    const toNum = (v) => (v === null || v === undefined || v === "" ? null : parseDecimalFlexible(v));
     const consumo = toNum(consumo_kw);
     const price = toNum(preco);
     const qnt = Number(quantidade ?? 1);
 
-    // coin opcional no update: normaliza se vier, caso contrário deixa a existente
     const coinNormalized =
       typeof coin === "string" && coin.trim()
         ? coin.trim().toUpperCase()
@@ -226,11 +246,9 @@ export async function deleteStoreMiner(req, res) {
   }
 }
 
+// ====== Atribuir a utilizador ======
 
-// util
-const normalizeDecimal = (v) =>
-  v === null || v === undefined || v === "" ? null : Number(String(v).trim().replace(/\s+/g, "").replace(/\./g, "").replace(",", "."));
-
+// Gera uma lista de worker_names a partir de padrão e quantidade
 function generateWorkerList(input, qty) {
   const trimmed = String(input || "").trim();
   qty = Math.max(1, Number(qty) || 1);
@@ -267,7 +285,7 @@ export async function assignStoreMinerToUser(req, res) {
     const {
       email,
       quantity = 1,
-      worker_pattern,         // ex: "acc.001", "acc", "001" (gera lista server-side)
+      worker_pattern,         // ex: "acc.001", "acc", "001"
       nome,                   // overrides opcionais
       modelo,
       hash_rate,
@@ -300,15 +318,24 @@ export async function assignStoreMinerToUser(req, res) {
     const [sm] = await sql`SELECT * FROM store_miners WHERE id = ${id} LIMIT 1;`;
     if (!sm) return res.status(404).json({ error: "Máquina da loja não encontrada." });
 
-    // 3) Defaults a partir da loja + overrides do body
+    // 3) Defaults a partir da loja + overrides do body (com decimais corretos)
     const baseNome   = (nome ?? sm.nome) || "Miner";
     const useModelo  = (modelo ?? sm.modelo) || null;
-    const useHash    = (hash_rate ?? sm.hash_rate) || null;    // tua coluna é text
-    const useConsumo = normalizeDecimal(consumo_kw_hora ?? sm.consumo_kw);
-    const usePreco   = normalizeDecimal(preco_kw);
+    const useHash    = (hash_rate ?? sm.hash_rate) || null; // texto
+
+    // <<<<<<<<<<<<<<<< AQUI ESTÁ A CORREÇÃO >>>>>>>>>>>>>>>>
+    const useConsumo = parseDecimalFlexible(
+      consumo_kw_hora ?? sm.consumo_kw
+    );
+    const usePreco   = parseDecimalFlexible(preco_kw);
+
     const useCoin    = (coin || sm.coin || null);
     const usePool    = pool || null;
     const useApiKey  = api_key || null;
+
+    if (!Number.isFinite(useConsumo) || !Number.isFinite(usePreco)) {
+      return res.status(400).json({ error: "Valores numéricos inválidos (consumo/preço)." });
+    }
 
     const qty = Math.max(1, Number(quantity) || 1);
     const workers = generateWorkerList(worker_pattern, qty);
@@ -369,5 +396,3 @@ export async function assignStoreMinerToUser(req, res) {
     return res.status(500).json({ error: "Erro ao atribuir máquina ao utilizador." });
   }
 }
-
-

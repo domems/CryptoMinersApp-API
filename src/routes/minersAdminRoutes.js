@@ -12,13 +12,21 @@ import {
 
 const router = Router();
 
-router.get("/ping", ping);
-router.get("/miners-by-email", listarMinersPorEmail);
-router.get("/miners", listarTodasAsMiners);
-router.get("/miners-status", obterStatusBatch);
-router.get("/miners/:id/status", obterStatusPorId);
-router.get("/miners/:id", obterMinerPorId);
-router.patch("/miners/:id", patchMinerPorId);
-router.put("/miners/:id", patchMinerPorId);
+// Health
+router.get("/admin/ping", adminOnly, ping);
+
+// Listagens
+router.get("/admin/miners-all", adminOnly, listarTodasAsMiners);
+router.get("/admin/miners",     adminOnly, listarTodasAsMiners); // alias
+router.get("/admin/miners-by-email", adminOnly, listarMinersPorEmail);
+
+// Status
+router.get("/admin/miners-status", adminOnly, obterStatusBatch);
+router.get("/admin/miners/:id/status", adminOnly, obterStatusPorId);
+
+// CRUD por ID
+router.get("/admin/miners/:id", adminOnly, obterMinerPorId);
+router.patch("/admin/miners/:id", adminOnly, patchMinerPorId);
+router.put("/admin/miners/:id", adminOnly, patchMinerPorId);
 
 export default router;

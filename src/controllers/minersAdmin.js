@@ -186,23 +186,24 @@ export async function obterMinerPorId(req, res) {
 }
 
 // PATCH/PUT /api/admin/miners/:id
+// PATCH/PUT /api/admin/miners/:id — atualização parcial e validada
 export async function patchMinerPorId(req, res) {
   try {
     const id = parseInt(String(req.params.id || ""), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
 
-    // (opcional mas útil) confirma existência antes de atualizar
+    // 1) Confirma existência (evita falsos 404 por RETURNING em libs diferentes)
     const exists = await sql/*sql*/`
-      SELECT 1 FROM miners WHERE id = ${id} LIMIT 1
+      SELECT id FROM miners WHERE id = ${id} LIMIT 1
     `;
-    if (!exists.length) return res.status(404).json({ error: "Miner não encontrada." });
+    if (!exists?.length) return res.status(404).json({ error: "Miner não encontrada." });
 
     const body = req.body || {};
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
     const pickStr = (k) => {
-      if (!has(k)) return undefined;
+      if (!has(k)) return undefined;        // não enviado
       const v = body[k];
-      if (v === null) return null;
+      if (v === null) return null;          // limpar
       if (typeof v === "string") {
         const s = v.trim();
         return s === "" ? null : s;
@@ -211,75 +212,91 @@ export async function patchMinerPorId(req, res) {
     };
 
     // strings
-    const nome = pickStr("nome");
-    const modelo = pickStr("modelo");
+    const nome        = pickStr("nome");
+    const modelo      = pickStr("modelo");
     const worker_name = pickStr("worker_name");
-    const api_key = pickStr("api_key");
+    const api_key     = pickStr("api_key");
 
     // números (NUMERIC)
-    const preco_kw = has("preco_kw") ? normalizeDecimal(body.preco_kw) : undefined;
-    const consumo_kw_hora = has("consumo_kw_hora") ? normalizeDecimal(body.consumo_kw_hora) : undefined;
+    const normalizeDecimal = (v) => {
+      if (v === undefined) return undefined;
+      if (v === null || v === "") return null;
+      if (typeof v === "number") return Number.isFinite(v) ? v : null;
+      let s = String(v).trim().replace(/\s+/g, "");
+      const hasComma = s.includes(",");
+      const hasDot   = s.includes(".");
+      if (hasComma && hasDot) s = s.replace(/\./g, "").replace(/,/g, ".");
+      else if (hasComma)      s = s.replace(/,/g, ".");
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    };
+    const hash_rate         = has("hash_rate")         ? (body.hash_rate == null ? null : String(body.hash_rate)) : undefined; // TEXT
+    const preco_kw          = has("preco_kw")          ? normalizeDecimal(body.preco_kw) : undefined;                            // NUMERIC
+    const consumo_kw_hora   = has("consumo_kw_hora")   ? normalizeDecimal(body.consumo_kw_hora) : undefined;                    // NUMERIC
 
-    // hash_rate é TEXT na BD
-    let hash_rate = has("hash_rate") ? body.hash_rate : undefined;
-    if (hash_rate !== undefined) {
-      if (hash_rate === null || hash_rate === "") hash_rate = null;
-      else hash_rate = String(hash_rate).trim();
-    }
-
-    // coin / pool validadas
+    // coin/pool com whitelist
+    const COIN_WHITELIST = ["BTC","BCH","XEC","LTC","ETC","ZEC","DASH","CKB","HNS","KAS"];
     let coin = pickStr("coin");
     if (coin !== undefined && coin !== null) {
       coin = String(coin).toUpperCase();
-      const COIN_WHITELIST = ["BTC","BCH","XEC","LTC","ETC","ZEC","DASH","CKB","HNS","KAS"];
-      if (!COIN_WHITELIST.includes(coin)) return res.status(400).json({ error: "Moeda inválida." });
+      if (!COIN_WHITELIST.includes(coin)) {
+        return res.status(400).json({ error: "Moeda inválida." });
+      }
     }
+
+    const POOL_WHITELIST = ["ViaBTC", "LiteCoinPool"];
     let pool = pickStr("pool");
     if (pool !== undefined && pool !== null) {
-      const POOL_WHITELIST = ["ViaBTC", "LiteCoinPool"];
       const P = String(pool);
-      if (!POOL_WHITELIST.includes(P)) return res.status(400).json({ error: "Pool inválida." });
+      if (!POOL_WHITELIST.includes(P)) {
+        return res.status(400).json({ error: "Pool inválida." });
+      }
       pool = P;
     }
 
-    // construir SET dinâmico
+    // 2) Construir UPDATE dinâmico
     const sets = [];
     const params = [];
-    const add = (col, val) => {
-      sets.push(`${col} = $${params.length + 1}`);
-      params.push(val);
-    };
+    const add = (col, val) => { sets.push(`${col} = $${params.length + 1}`); params.push(val); };
 
-    if (nome !== undefined) add("nome", nome);
-    if (modelo !== undefined) add("modelo", modelo);
-    if (hash_rate !== undefined) add("hash_rate", hash_rate);                 // TEXT
-    if (preco_kw !== undefined) add("preco_kw", preco_kw);                    // NUMERIC
-    if (consumo_kw_hora !== undefined) add("consumo_kw_hora", consumo_kw_hora); // NUMERIC
+    if (nome        !== undefined) add("nome", nome);
+    if (modelo      !== undefined) add("modelo", modelo);
+    if (hash_rate   !== undefined) add("hash_rate", hash_rate);               // TEXT (string|null)
+    if (preco_kw    !== undefined) add("preco_kw", preco_kw);                 // NUMERIC (number|null)
+    if (consumo_kw_hora !== undefined) add("consumo_kw_hora", consumo_kw_hora);
     if (worker_name !== undefined) add("worker_name", worker_name);
-    if (api_key !== undefined) add("api_key", api_key);
-    if (coin !== undefined) add("coin", coin);
-    if (pool !== undefined) add("pool", pool);
+    if (api_key     !== undefined) add("api_key", api_key);
+    if (coin        !== undefined) add("coin", coin);
+    if (pool        !== undefined) add("pool", pool);
 
-    if (sets.length === 0) {
+    if (!sets.length) {
       return res.status(400).json({ error: "Nada para atualizar." });
     }
 
-    // ⚠️ cast explícito no WHERE
-    const q = `
+    // 3) Executa UPDATE (parametrizado) + SELECT final
+    const updateSQL = `
       UPDATE miners
       SET ${sets.join(", ")}
-      WHERE id = $${params.length + 1}::int
-      RETURNING *
+      WHERE id = $${params.length + 1}
     `;
-    const updated = await sql.unsafe(q, [...params, id]);
-    const rows = Array.isArray(updated) ? updated : Array.isArray(updated?.rows) ? updated.rows : [];
+    await sql.unsafe(updateSQL, [...params, id]);
 
-    if (!rows?.length) return res.status(404).json({ error: "Miner não encontrada." });
+    const refreshed = await sql/*sql*/`
+      SELECT *
+      FROM miners
+      WHERE id = ${id}
+      LIMIT 1
+    `;
+    if (!refreshed?.length) {
+      // extremamente improvável, mas deixa 404 consistente
+      return res.status(404).json({ error: "Miner não encontrada." });
+    }
 
-    res.json({ ok: true, miner: rows[0] });
+    return res.json({ ok: true, miner: refreshed[0] });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });
   }
 }
+
 

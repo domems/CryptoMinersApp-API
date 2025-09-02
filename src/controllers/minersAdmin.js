@@ -195,12 +195,12 @@ export async function obterMinerPorId(req, res) {
 // PATCH/PUT /api/admin/miners/:id — atualização parcial e validada
 export async function patchMinerPorId(req, res) {
   try {
+    // 1) Verifica existência
     const where = whereById(req.params.id);
-
-    // Garante que existe antes (evita 'não encontrada' por update a zero linhas por engano)
     const exists = await sql/*sql*/`SELECT 1 FROM miners WHERE ${where} LIMIT 1`;
     if (!exists.length) return res.status(404).json({ error: "Miner não encontrada." });
 
+    // 2) Normaliza inputs
     const body = req.body || {};
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
     const pickStr = (k) => {
@@ -214,18 +214,15 @@ export async function patchMinerPorId(req, res) {
       return v;
     };
 
-    // strings
     const nome = pickStr("nome");
     const modelo = pickStr("modelo");
     const worker_name = pickStr("worker_name");
     const api_key = pickStr("api_key");
 
-    // números
     const hash_rate = has("hash_rate") ? normalizeDecimal(body.hash_rate) : undefined;
     const preco_kw = has("preco_kw") ? normalizeDecimal(body.preco_kw) : undefined;
     const consumo_kw_hora = has("consumo_kw_hora") ? normalizeDecimal(body.consumo_kw_hora) : undefined;
 
-    // coin / pool validadas
     let coin = pickStr("coin");
     if (coin !== undefined && coin !== null) {
       coin = String(coin).toUpperCase();
@@ -239,31 +236,48 @@ export async function patchMinerPorId(req, res) {
       pool = P;
     }
 
-    // Construir SET dinâmico (parametrizado com template tag do driver)
+    // 3) Monta SET dinâmico com placeholders
     const sets = [];
-    if (nome !== undefined) sets.push(sql`nome = ${nome}`);
-    if (modelo !== undefined) sets.push(sql`modelo = ${modelo}`);
-    if (hash_rate !== undefined) sets.push(sql`hash_rate = ${hash_rate}`);
-    if (preco_kw !== undefined) sets.push(sql`preco_kw = ${preco_kw}`);
-    if (consumo_kw_hora !== undefined) sets.push(sql`consumo_kw_hora = ${consumo_kw_hora}`);
-    if (worker_name !== undefined) sets.push(sql`worker_name = ${worker_name}`);
-    if (api_key !== undefined) sets.push(sql`api_key = ${api_key}`);
-    if (coin !== undefined) sets.push(sql`coin = ${coin}`);
-    if (pool !== undefined) sets.push(sql`pool = ${pool}`);
+    const params = [];
+
+    const add = (col, val) => {
+      sets.push(`${col} = $${params.length + 1}`);
+      params.push(val);
+    };
+
+    if (nome !== undefined) add("nome", nome);
+    if (modelo !== undefined) add("modelo", modelo);
+    if (hash_rate !== undefined) add("hash_rate", hash_rate);
+    if (preco_kw !== undefined) add("preco_kw", preco_kw);
+    if (consumo_kw_hora !== undefined) add("consumo_kw_hora", consumo_kw_hora);
+    if (worker_name !== undefined) add("worker_name", worker_name);
+    if (api_key !== undefined) add("api_key", api_key);
+    if (coin !== undefined) add("coin", coin);
+    if (pool !== undefined) add("pool", pool);
 
     if (!sets.length) {
       return res.status(400).json({ error: "Nada para atualizar." });
     }
 
-    const updated = await sql/*sql*/`
+    // 4) WHERE flexível também em unsafe
+    const idStr = String(req.params.id ?? "").trim();
+    const idNum = Number(idStr);
+    const whereClause =
+      Number.isInteger(idNum) ? `id = $${params.length + 1}` : `id::text = $${params.length + 1}`;
+    const whereValue = Number.isInteger(idNum) ? idNum : idStr;
+
+    const query = `
       UPDATE miners
-      SET ${sql.join(sets, sql`, `)}
-      WHERE ${where}
+      SET ${sets.join(", ")}
+      WHERE ${whereClause}
       RETURNING *
     `;
 
-    if (!updated?.length) return res.status(404).json({ error: "Miner não encontrada." });
-    res.json({ ok: true, miner: updated[0] });
+    const updated = await sql.unsafe(query, [...params, whereValue]);
+    const rows = Array.isArray(updated) ? updated : Array.isArray(updated?.rows) ? updated.rows : [];
+    if (!rows?.length) return res.status(404).json({ error: "Miner não encontrada." });
+
+    res.json({ ok: true, miner: rows[0] });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });

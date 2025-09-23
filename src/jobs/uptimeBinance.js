@@ -5,7 +5,16 @@ import fetch from "node-fetch";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
-/** ===== time slot (15 min, UTC) ===== */
+/* ===== Bases possíveis (rota automaticamente) ===== */
+const CANDIDATE_BASES = [
+  process.env.BINANCE_BASE,                // opcional override
+  "https://api.binance.com",
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+  "https://api3.binance.com",
+].filter(Boolean);
+
+/* ===== time slot (15 min, UTC) ===== */
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
@@ -13,7 +22,7 @@ function slotISO(d = new Date()) {
   return t.toISOString();
 }
 
-/** ===== helpers ===== */
+/* ===== helpers ===== */
 const norm = (s) => String(s ?? "").trim();
 function clean(s) {
   return String(s ?? "").normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
@@ -39,9 +48,7 @@ function splitAccountWorker(row) {
   return { account: wn.slice(0, i), worker: wn.slice(i + 1) };
 }
 
-/** ===== Binance signed fetch ===== */
-const BINANCE_BASE = "https://api.binance.com";
-
+/* ===== Binance signed fetch ===== */
 function signQuery(secret, params) {
   const qs = new URLSearchParams(params).toString();
   const sig = crypto.createHmac("sha256", secret).update(qs).digest("hex");
@@ -63,9 +70,10 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
       await new Promise(r => setTimeout(r, 300 * attempt + Math.random() * 300));
       continue;
     }
-    if (resp.status === 429 || resp.status >= 500) {
+    // geoblock / auth / overload: tenta mais um pouco e devolve
+    if (resp.status === 451 || resp.status === 403 || resp.status === 401 || resp.status === 429 || resp.status >= 500) {
       if (attempt > retries) return resp;
-      const ra = Number(resp.headers.get("retry-after")) || (300 * attempt);
+      const ra = Number(resp.headers.get("retry-after")) || (350 * attempt);
       await new Promise(r => setTimeout(r, ra + Math.random() * 300));
       continue;
     }
@@ -73,39 +81,60 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
   }
 }
 
-/** Lista todos os workers de uma conta (pagina até esgotar) e LOGA o retorno. */
-async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
+/** IP de saída do host (para debug de geoblock) */
+async function egressIP() {
+  try {
+    const r = await fetchWithRetry("https://api.ipify.org?format=text", { timeout: 6000 }, 0);
+    if (!r.ok) return "?";
+    return (await r.text()).trim();
+  } catch { return "?"; }
+}
+
+/** Escolhe a primeira base que responda 200 (não 451) */
+async function pickBinanceBase() {
+  for (const base of CANDIDATE_BASES) {
+    try {
+      const resp = await fetchWithRetry(`${base}/api/v3/exchangeInfo`, { timeout: 7000 }, 1);
+      if (resp.ok) return { base, status: resp.status };
+      if (resp.status === 451) {
+        console.warn("[uptime:binance] base geoblocked:", base);
+        continue;
+      }
+      // outros erros: tenta a próxima
+    } catch {}
+  }
+  return { base: null, status: 0 };
+}
+
+/** Lista todos os workers (pagina) usando a base escolhida */
+async function binanceListWorkers({ base, apiKey, secretKey, algo, userName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const pageSize = 200;
   let page = 1;
   const all = [];
 
-  for (;;) {
+  while (true) {
     const params = { algo, userName, pageIndex: page, sort: 0, timestamp: Date.now(), recvWindow: 10_000 };
-    const url = `${BINANCE_BASE}/sapi/v1/mining/worker/list?${signQuery(secretKey, params)}`;
+    const url = `${base}/sapi/v1/mining/worker/list?${signQuery(secretKey, params)}`;
     const resp = await fetchWithRetry(url, { headers }, 2);
 
     console.log("[binance:api:list]", {
-      account: userName,
-      algo,
-      page,
-      httpStatus: resp.status,
-      ok: resp.ok,
-      apiKey: mask(apiKey),
+      account: userName, algo, page, httpStatus: resp.status, ok: resp.ok, apiKey: mask(apiKey), base
     });
 
-    if (!resp.ok) break;
+    if (resp.status === 451) return { ok: false, status: 451, reason: "geoblocked", workers: [] };
+    if (resp.status === 403 || resp.status === 401) return { ok: false, status: resp.status, reason: "auth", workers: [] };
+    if (!resp.ok) return { ok: false, status: resp.status, reason: "http", workers: [] };
 
     const data = await resp.json().catch(() => null);
     const arr = data?.data?.workerDatas || [];
 
-    // LOGA amostra da página
     console.log("[binance:api:list:page]", {
       account: userName,
       algo,
       page,
       returned: arr.length,
-      sample: arr.slice(0, 10).map(w => ({
+      sample: arr.slice(0, 5).map(w => ({
         workerName: w?.workerName,
         status: w?.status,
         hashRate: w?.hashRate,
@@ -119,7 +148,6 @@ async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
     page += 1;
   }
 
-  // LOGA resumo agregado do que a API devolveu
   console.log("[binance:api:list:all]", {
     account: userName,
     algo,
@@ -127,23 +155,25 @@ async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
     names: all.map(w => String(w?.workerName ?? "")),
   });
 
-  return all.map(w => ({
+  const workers = all.map(w => ({
     workerName: clean(w?.workerName),
     status: Number(w?.status ?? 0),        // 1 valid, 2 invalid, 3 no longer valid
     hashRate: Number(w?.hashRate ?? 0),
     lastShareTime: Number(w?.lastShareTime ?? 0),
   }));
+
+  return { ok: true, status: 200, workers };
 }
 
-/** Detalhe de um worker (sempre LOGA resultado se chamado). */
-async function binanceWorkerDetail({ apiKey, secretKey, algo, userName, workerName }) {
+/** Detalhe de um worker (diagnóstico) */
+async function binanceWorkerDetail({ base, apiKey, secretKey, algo, userName, workerName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const params = { algo, userName, workerName, timestamp: Date.now(), recvWindow: 10_000 };
-  const url = `${BINANCE_BASE}/sapi/v1/mining/worker/detail?` + signQuery(secretKey, params);
+  const url = `${base}/sapi/v1/mining/worker/detail?` + signQuery(secretKey, params);
   const resp = await fetchWithRetry(url, { headers }, 2);
 
   console.log("[binance:api:detail:call]", {
-    account: userName, workerName, algo, httpStatus: resp.status, ok: resp.ok, apiKey: mask(apiKey),
+    account: userName, workerName, algo, httpStatus: resp.status, ok: resp.ok, apiKey: mask(apiKey), base
   });
 
   if (!resp.ok) return null;
@@ -172,7 +202,7 @@ function isOnlineBinance(w) {
   return Number(w.status) === 1;
 }
 
-/** ===== slot dedupe (in-process) ===== */
+/* ===== slot dedupe (in-process) ===== */
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
@@ -182,7 +212,7 @@ function dedupeForHours(ids) {
   return out;
 }
 
-/** ===== Job principal ===== */
+/* ===== Job principal ===== */
 export async function runUptimeBinanceOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
@@ -202,6 +232,16 @@ export async function runUptimeBinanceOnce() {
   let apiCalls = 0;
 
   try {
+    // Escolhe base alcançável
+    const picked = await pickBinanceBase();
+    if (!picked.base) {
+      const ip = await egressIP();
+      console.warn("[uptime:binance] Todas as bases geoblocked ou indisponíveis (provável 451).", { egressIP: ip });
+      return { ok: true, skipped: true, reason: "geoblocked_all" };
+    }
+    const BASE = picked.base;
+    console.log("[uptime:binance] BASE escolhida:", BASE);
+
     const minersRaw = await sql/*sql*/`
       SELECT id, worker_name, api_key, secret_key, coin, status
       FROM miners
@@ -258,11 +298,25 @@ export async function runUptimeBinanceOnce() {
       console.log("[uptime:binance] GROUP START", {
         account: userName, algo, miners: list.length,
         apiKey: mask(apiKey), secretKey: mask(secretKey),
-        wantWorkers: Array.from(want.keys())
+        wantWorkers: Array.from(want.keys()),
+        base: BASE,
       });
 
-      const workers = await binanceListWorkers({ apiKey, secretKey, algo, userName });
+      const { ok, status, reason, workers } = await binanceListWorkers({ base: BASE, apiKey, secretKey, algo, userName });
       apiCalls += 1;
+
+      if (!ok) {
+        // geoblock / auth / http -> não marcar offline
+        const ip = await egressIP();
+        console.warn("[uptime:binance] GROUP SKIPPED", {
+          account: userName, algo, reason, httpStatus: status, egressIP: ip, base: BASE
+        });
+        // tenta detail de amostra
+        for (const wName of Array.from(want.keys()).slice(0, 1)) {
+          await binanceWorkerDetail({ base: BASE, apiKey, secretKey, algo, userName, workerName: wName }).catch(() => {});
+        }
+        return;
+      }
 
       // Dump dos nomes devolvidos (para comparar com want)
       console.log("[uptime:binance] API workers (names)", {
@@ -275,7 +329,6 @@ export async function runUptimeBinanceOnce() {
       let offlineExplicit = 0;
       let offlineMissing  = 0;
 
-      // match exato após clean() dos dois lados
       for (const w of workers) {
         const name = clean(w.workerName);
         if (!want.has(name)) continue;
@@ -284,20 +337,17 @@ export async function runUptimeBinanceOnce() {
         else { offlineIdsRaw.push(...ids); offlineExplicit += ids.length; }
       }
 
-      // tudo o que pedimos e NÃO veio na API → offline (missing)
+      // Tudo o que pedimos e NÃO veio → offline (missing)
       for (const [wName, ids] of want.entries()) {
         const seen = onlineIdsRaw.concat(offlineIdsRaw);
         if (!seen.some(id => ids.includes(id))) {
           offlineIdsRaw.push(...ids);
           offlineMissing += ids.length;
           console.warn("[uptime:binance] NOT IN API → OFFLINE", { account: userName, worker: wName });
-          // Chama detail para mostrar o que a Binance diz sobre este worker
-          await binanceWorkerDetail({ apiKey, secretKey, algo, userName, workerName: wName })
-            .catch(() => {});
+          await binanceWorkerDetail({ base: BASE, apiKey, secretKey, algo, userName, workerName: wName }).catch(() => {});
         }
       }
 
-      // === Batch único via CTE ===
       const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
       const r = await sql/*sql*/`
         WITH
@@ -330,6 +380,10 @@ export async function runUptimeBinanceOnce() {
       const onCount  = Number(r?.[0]?.on_count  || 0);
       const offCount = Number(r?.[0]?.off_count || 0);
 
+      hoursUpdated   += incCount;
+      statusToOnline += onCount;
+      statusToOffline+= offCount;
+
       console.log("[uptime:binance] GROUP RESULT", {
         account: userName,
         algo,
@@ -342,8 +396,6 @@ export async function runUptimeBinanceOnce() {
         statusOn: onCount,
         statusOff: offCount,
       });
-
-      return { incCount, onCount, offCount };
     }
 
     for (const [key, list] of groups.entries()) {

@@ -1,5 +1,6 @@
 import { startUptimeViaBTC } from "./uptimeViaBTC.js";
 import { startUptimeLTCPool } from "./uptimeLiteCoinPool.js";
+import { startUptimeBinance } from "./uptimeBinance.js";
 
 let started = false;
 
@@ -13,6 +14,7 @@ export function startAllJobs() {
   // cada job tem o seu próprio lock por slot
   startUptimeViaBTC();
   startUptimeLTCPool();
+  startUptimeBinance();
 
   // (opcional) fecho mensal
   import("./monthlyClose.js")

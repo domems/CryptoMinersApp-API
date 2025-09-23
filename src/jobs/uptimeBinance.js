@@ -5,12 +5,7 @@ import fetch from "node-fetch";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
-/* ====== Config Debug ====== */
-const BINANCE_DEBUG = process.env.BINANCE_DEBUG === "1";
-const DEBUG_ACCOUNTS = new Set((process.env.BINANCE_DEBUG_ACCOUNTS || "toplessEI")
-  .split(",").map(s => s.trim()).filter(Boolean));
-
-/** === time slot (15 min, UTC) === */
+/** ===== time slot (15 min, UTC) ===== */
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
@@ -18,18 +13,15 @@ function slotISO(d = new Date()) {
   return t.toISOString();
 }
 
-/** === helpers === */
+/** ===== helpers ===== */
 const norm = (s) => String(s ?? "").trim();
-/** remove zero-width, normaliza NFKC e trim */
 function clean(s) {
-  return String(s ?? "")
-    .normalize("NFKC")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .trim();
+  return String(s ?? "").normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
 }
 function mask(s, keep = 6) {
   const t = String(s ?? "");
   if (!t) return "";
+  if (t.length <= keep + 2) return `${t.slice(0, 2)}***`;
   return t.slice(0, keep) + "***" + t.slice(-2);
 }
 function mapAlgo(coin) {
@@ -39,16 +31,15 @@ function mapAlgo(coin) {
   if (c === "KAS" || c === "KASPA") return "kHeavyHash";
   return "";
 }
-
-/** Extrai MiningAccount e Worker a partir de "MiningAccount.Worker". */
+/** Extrai MiningAccount e Worker de "MiningAccount.Worker" (descarta se faltar o ponto). */
 function splitAccountWorker(row) {
   const wn = clean(row.worker_name);
-  const dot = wn.indexOf(".");
-  if (dot <= 0) return { account: "", worker: "" }; // inválido
-  return { account: wn.slice(0, dot), worker: wn.slice(dot + 1) };
+  const i = wn.indexOf(".");
+  if (i <= 0) return { account: "", worker: "" };
+  return { account: wn.slice(0, i), worker: wn.slice(i + 1) };
 }
 
-/** === Binance signed fetch === */
+/** ===== Binance signed fetch ===== */
 const BINANCE_BASE = "https://api.binance.com";
 
 function signQuery(secret, params) {
@@ -82,46 +73,60 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
   }
 }
 
-/** Lista todos os workers de uma conta (pagina até esgotar) + DEBUG */
+/** Lista todos os workers de uma conta (pagina até esgotar) e LOGA o retorno. */
 async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const pageSize = 200;
   let page = 1;
   const all = [];
+
   for (;;) {
-    const params = {
-      algo,
-      userName,
-      pageIndex: page,
-      sort: 0,
-      timestamp: Date.now(),
-      recvWindow: 10_000,
-    };
-    const signed = signQuery(secretKey, params);
-    const url = `${BINANCE_BASE}/sapi/v1/mining/worker/list?${signed}`;
+    const params = { algo, userName, pageIndex: page, sort: 0, timestamp: Date.now(), recvWindow: 10_000 };
+    const url = `${BINANCE_BASE}/sapi/v1/mining/worker/list?${signQuery(secretKey, params)}`;
     const resp = await fetchWithRetry(url, { headers }, 2);
-    if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-      console.log("[binance:debug] list",
-        { userName, algo, page, status: resp.status, ok: resp.ok, apiKey: mask(apiKey) }
-      );
-    }
+
+    console.log("[binance:api:list]", {
+      account: userName,
+      algo,
+      page,
+      httpStatus: resp.status,
+      ok: resp.ok,
+      apiKey: mask(apiKey),
+    });
+
     if (!resp.ok) break;
+
     const data = await resp.json().catch(() => null);
     const arr = data?.data?.workerDatas || [];
-    all.push(...arr);
-    const pageSizeResp = Number(data?.data?.pageSize || 0);
-    if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-      const sample = arr.slice(0, 10).map(w => ({
+
+    // LOGA amostra da página
+    console.log("[binance:api:list:page]", {
+      account: userName,
+      algo,
+      page,
+      returned: arr.length,
+      sample: arr.slice(0, 10).map(w => ({
         workerName: w?.workerName,
         status: w?.status,
         hashRate: w?.hashRate,
-        lastShareTime: w?.lastShareTime
-      }));
-      console.log("[binance:debug] page sample", sample);
-    }
+        lastShareTime: w?.lastShareTime,
+      })),
+    });
+
+    all.push(...arr);
+    const pageSizeResp = Number(data?.data?.pageSize || 0);
     if (!arr.length || arr.length < (pageSizeResp || pageSize)) break;
     page += 1;
   }
+
+  // LOGA resumo agregado do que a API devolveu
+  console.log("[binance:api:list:all]", {
+    account: userName,
+    algo,
+    totalWorkersReturned: all.length,
+    names: all.map(w => String(w?.workerName ?? "")),
+  });
+
   return all.map(w => ({
     workerName: clean(w?.workerName),
     status: Number(w?.status ?? 0),        // 1 valid, 2 invalid, 3 no longer valid
@@ -130,18 +135,34 @@ async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
   }));
 }
 
-/** Detalhe de um worker (diagnóstico extra) */
+/** Detalhe de um worker (sempre LOGA resultado se chamado). */
 async function binanceWorkerDetail({ apiKey, secretKey, algo, userName, workerName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const params = { algo, userName, workerName, timestamp: Date.now(), recvWindow: 10_000 };
   const url = `${BINANCE_BASE}/sapi/v1/mining/worker/detail?` + signQuery(secretKey, params);
   const resp = await fetchWithRetry(url, { headers }, 2);
-  if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-    console.log("[binance:debug] detail",
-      { userName, workerName, algo, status: resp.status, ok: resp.ok, apiKey: mask(apiKey) });
-  }
+
+  console.log("[binance:api:detail:call]", {
+    account: userName, workerName, algo, httpStatus: resp.status, ok: resp.ok, apiKey: mask(apiKey),
+  });
+
   if (!resp.ok) return null;
   const data = await resp.json().catch(() => null);
+
+  console.log("[binance:api:detail:resp]", {
+    account: userName,
+    workerName,
+    algo,
+    data: data?.data ? {
+      workerName: data.data.workerName,
+      status: data.data.status,
+      type: data.data.type,
+      hashRate: data.data.hashRate,
+      dayHashRate: data.data.dayHashRate,
+      lastShareTime: data.data.lastShareTime,
+    } : null,
+  });
+
   return data;
 }
 
@@ -151,7 +172,7 @@ function isOnlineBinance(w) {
   return Number(w.status) === 1;
 }
 
-/** === slot dedupe (in-process) === */
+/** ===== slot dedupe (in-process) ===== */
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
@@ -166,7 +187,7 @@ export async function runUptimeBinanceOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
-  // Lock distribuído
+  // Lock distribuído (20 min para cobrir desvios)
   const lockKey = `uptime:${sISO}:binance`;
   const gotRedis = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 });
   if (!gotRedis) {
@@ -190,6 +211,7 @@ export async function runUptimeBinanceOnce() {
     `;
     if (!minersRaw.length) return { ok: true, updated: 0, statusChanged: 0 };
 
+    // Normaliza e valida (exige account.worker e algo válido)
     const miners = minersRaw
       .map(r => {
         const { account, worker } = splitAccountWorker(r);
@@ -198,16 +220,15 @@ export async function runUptimeBinanceOnce() {
       })
       .filter(m => m.account && m.worker && m.algo);
 
-    // DEBUG: listar entradas inválidas descartadas
-    if (BINANCE_DEBUG) {
-      const invalid = minersRaw.filter(r => {
-        const { account, worker } = splitAccountWorker(r);
-        return !(account && worker && mapAlgo(r.coin));
-      });
-      if (invalid.length) {
-        console.warn("[binance:debug] DESCARTADOS (sem ponto ou coin inválida):",
-          invalid.map(x => ({ id: x.id, worker_name: x.worker_name, coin: x.coin })));
-      }
+    // Loga descartados (sem ponto ou coin inválida)
+    const discarded = minersRaw.filter(r => {
+      const { account, worker } = splitAccountWorker(r);
+      return !(account && worker && mapAlgo(r.coin));
+    });
+    if (discarded.length) {
+      console.warn("[uptime:binance] DESCARTADOS:", discarded.map(x => ({
+        id: x.id, worker_name: x.worker_name, coin: x.coin
+      })));
     }
 
     // Agrupa por credenciais + account + algo
@@ -234,25 +255,25 @@ export async function runUptimeBinanceOnce() {
         want.get(w).push(m.id);
       }
 
-      if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-        console.log("[binance:debug] GROUP START", {
-          account: userName, algo, miners: list.length,
-          apiKey: mask(apiKey), secretKey: mask(secretKey)
-        });
-        console.log("[binance:debug] WANT workers:", Array.from(want.keys()));
-      }
+      console.log("[uptime:binance] GROUP START", {
+        account: userName, algo, miners: list.length,
+        apiKey: mask(apiKey), secretKey: mask(secretKey),
+        wantWorkers: Array.from(want.keys())
+      });
 
       const workers = await binanceListWorkers({ apiKey, secretKey, algo, userName });
       apiCalls += 1;
 
-      // opcional: dump nomes para ver diferenças de casing/whitespace
-      if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-        const names = workers.map(w => w.workerName);
-        console.log("[binance:debug] API workers names:", names);
-      }
+      // Dump dos nomes devolvidos (para comparar com want)
+      console.log("[uptime:binance] API workers (names)", {
+        account: userName,
+        names: workers.map(w => w.workerName),
+      });
 
       let onlineIdsRaw = [];
       let offlineIdsRaw = [];
+      let offlineExplicit = 0;
+      let offlineMissing  = 0;
 
       // match exato após clean() dos dois lados
       for (const w of workers) {
@@ -260,47 +281,19 @@ export async function runUptimeBinanceOnce() {
         if (!want.has(name)) continue;
         const ids = want.get(name);
         if (isOnlineBinance(w)) onlineIdsRaw.push(...ids);
-        else offlineIdsRaw.push(...ids);
+        else { offlineIdsRaw.push(...ids); offlineExplicit += ids.length; }
       }
 
-      // tudo o que pedimos e NÃO veio na API → offline
+      // tudo o que pedimos e NÃO veio na API → offline (missing)
       for (const [wName, ids] of want.entries()) {
         const seen = onlineIdsRaw.concat(offlineIdsRaw);
         if (!seen.some(id => ids.includes(id))) {
           offlineIdsRaw.push(...ids);
-          if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-            console.warn("[binance:debug] NOT IN API, marking OFFLINE", { account: userName, wName });
-          }
-        }
-      }
-
-      // DEBUG extra para um worker específico (ex.: toplessEI.001)
-      if (BINANCE_DEBUG && DEBUG_ACCOUNTS.has(userName)) {
-        const target = "001"; // sufixo do teu worker
-        const wantHas = want.has(target);
-        console.log("[binance:debug] target presence", {
-          account: userName,
-          target,
-          wantHas,
-          onlineContains: onlineIdsRaw.length ? "yes" : "no",
-        });
-
-        if (wantHas) {
-          // chama detail para diagnóstico final
-          const detail = await binanceWorkerDetail({ apiKey, secretKey, algo, userName, workerName: target });
-          console.log("[binance:debug] DETAIL response (sanitized)", {
-            account: userName,
-            target,
-            ok: !!detail,
-            data: detail?.data ? {
-              status: detail.data.status,
-              workerName: detail.data.workerName,
-              type: detail.data.type,
-              hashRate: detail.data.hashRate,
-              dayHashRate: detail.data.dayHashRate,
-              lastShareTime: detail.data.lastShareTime
-            } : null
-          });
+          offlineMissing += ids.length;
+          console.warn("[uptime:binance] NOT IN API → OFFLINE", { account: userName, worker: wName });
+          // Chama detail para mostrar o que a Binance diz sobre este worker
+          await binanceWorkerDetail({ apiKey, secretKey, algo, userName, workerName: wName })
+            .catch(() => {});
         }
       }
 
@@ -337,12 +330,20 @@ export async function runUptimeBinanceOnce() {
       const onCount  = Number(r?.[0]?.on_count  || 0);
       const offCount = Number(r?.[0]?.off_count || 0);
 
-      hoursUpdated   += incCount;
-      statusToOnline += onCount;
-      statusToOffline+= offCount;
+      console.log("[uptime:binance] GROUP RESULT", {
+        account: userName,
+        algo,
+        miners: list.length,
+        onlineAPI: onlineIdsRaw.length,
+        offlineAPI: offlineIdsRaw.length,
+        offlineExplicit,
+        offlineMissing,
+        inc: incCount,
+        statusOn: onCount,
+        statusOff: offCount,
+      });
 
-      const coverage = list.length ? (onlineIdsRaw.length / list.length) : 0;
-      console.log(`[uptime:binance] account=${userName} algo=${algo} miners=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${offlineIdsRaw.length} cover=${(coverage*100).toFixed(1)}% inc=${incCount} on=${onCount} off=${offCount}`);
+      return { incCount, onCount, offCount };
     }
 
     for (const [key, list] of groups.entries()) {

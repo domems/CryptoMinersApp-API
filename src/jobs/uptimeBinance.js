@@ -15,25 +15,21 @@ function slotISO(d = new Date()) {
 
 /** === helpers === */
 const norm = (s) => String(s ?? "").trim();
-const low  = (s) => norm(s).toLowerCase();
 
 function mapAlgo(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC") return "sha256";
   if (c === "LTC") return "scrypt";
   if (c === "KAS" || c === "KASPA") return "kHeavyHash";
-  return ""; // força validação a falhar → skip
+  return "";
 }
 
-/** Extrai MiningAccount e Worker a partir de "MiningAccount.Worker".
- * Se não houver ".", tenta usar coluna `binance_user_name` (se vier na row). */
+/** Extrai MiningAccount e Worker a partir de "MiningAccount.Worker". */
 function splitAccountWorker(row) {
   const wn = norm(row.worker_name);
   const dot = wn.indexOf(".");
-  if (dot > 0) return { account: wn.slice(0, dot), worker: wn.slice(dot + 1) };
-  const account = norm(row.binance_user_name || "");
-  const worker  = wn;
-  return { account, worker };
+  if (dot <= 0) return { account: "", worker: "" }; // inválido
+  return { account: wn.slice(0, dot), worker: wn.slice(dot + 1) };
 }
 
 /** === Binance signed fetch === */
@@ -70,10 +66,10 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
   }
 }
 
-/** Lista TODOS os workers de uma conta (pagina até esgotar). */
+/** Lista todos os workers de uma conta (pagina até esgotar). */
 async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
-  const pageSize = 200; // max razoável (doc default=20). Ajusta se precisares.
+  const pageSize = 200;
   let page = 1;
   const all = [];
   for (;;) {
@@ -99,12 +95,12 @@ async function binanceListWorkers({ apiKey, secretKey, algo, userName }) {
   return all.map(w => ({
     workerName: String(w?.workerName ?? ""),
     status: Number(w?.status ?? 0),        // 1 valid, 2 invalid, 3 no longer valid
-    hashRate: Number(w?.hashRate ?? 0),    // realtime
+    hashRate: Number(w?.hashRate ?? 0),
     lastShareTime: Number(w?.lastShareTime ?? 0),
   }));
 }
 
-/** Online se hashRate > 0 OU status==1 (valid) — cf. docs. */
+/** Online se hashRate > 0 OU status==1 */
 function isOnlineBinance(w) {
   if (Number.isFinite(w.hashRate) && w.hashRate > 0) return true;
   return Number(w.status) === 1;
@@ -125,21 +121,12 @@ export async function runUptimeBinanceOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
-  // Lock distribuído (Redis) + backup lock PG
+  // Lock distribuído
   const lockKey = `uptime:${sISO}:binance`;
   const gotRedis = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 });
-  const lockHigh = 0x42494E5A; // 'BINZ'
-  const lockLow  = Math.floor(new Date(sISO).getTime() / (15 * 60 * 1000));
-  let gotPG = false;
   if (!gotRedis) {
-    try {
-      const r = await sql/*sql*/`SELECT pg_try_advisory_lock(${lockHigh}, ${lockLow}) AS ok`;
-      gotPG = !!r?.[0]?.ok;
-    } catch {}
-    if (!gotPG) {
-      console.log(`[uptime:binance] lock ativo (${sISO}) – skip`);
-      return { ok: true, skipped: true };
-    }
+    console.log(`[uptime:binance] lock ativo (${sISO}) – skip`);
+    return { ok: true, skipped: true };
   }
 
   let hoursUpdated = 0;
@@ -149,19 +136,15 @@ export async function runUptimeBinanceOnce() {
   let apiCalls = 0;
 
   try {
-    // Carrega miners da Binance
     const minersRaw = await sql/*sql*/`
-      SELECT id, worker_name, api_key, secret_key, coin,
-             NULLIF(binance_user_name, '') AS binance_user_name
+      SELECT id, worker_name, api_key, secret_key, coin
       FROM miners
       WHERE pool = 'Binance'
         AND api_key IS NOT NULL AND secret_key IS NOT NULL
         AND worker_name IS NOT NULL
     `;
-
     if (!minersRaw.length) return { ok: true, updated: 0, statusChanged: 0 };
 
-    // Normaliza (conta, worker, algo)
     const miners = minersRaw
       .map(r => {
         const { account, worker } = splitAccountWorker(r);
@@ -170,8 +153,7 @@ export async function runUptimeBinanceOnce() {
       })
       .filter(m => m.account && m.worker && m.algo);
 
-    // Agrupa por credenciais + account + algo
-    const groups = new Map(); // key -> Miner[]
+    const groups = new Map();
     for (const m of miners) {
       const k = `${m.api_key}|${m.secret_key}|${m.account}|${m.algo}`;
       if (!groups.has(k)) groups.set(k, []);
@@ -179,13 +161,11 @@ export async function runUptimeBinanceOnce() {
     }
     groupsCount = groups.size;
 
-    // Concurrency simples (3 grupos em paralelo)
     const CONC = 3;
     const running = new Set();
 
     async function processGroup(key, list) {
       const [apiKey, secretKey, userName, algo] = key.split("|");
-      // mapa worker -> [ids]
       const want = new Map();
       for (const m of list) {
         const w = norm(m.worker);
@@ -201,21 +181,16 @@ export async function runUptimeBinanceOnce() {
       let offlineIdsRaw = [];
       for (const w of workers) {
         const name = norm(w.workerName);
-        if (!want.has(name)) continue; // ignora outros workers da conta
+        if (!want.has(name)) continue;
         const ids = want.get(name);
         if (isOnlineBinance(w)) onlineIdsRaw.push(...ids);
         else offlineIdsRaw.push(...ids);
       }
-      // workers da lista que NÃO vieram na API → offline
       for (const [wName, ids] of want.entries()) {
-        // se nenhum registo da API foi visto com esse nome, marca offline
-        // (evita “fantasmas” não reportados)
-        const seenOnline = onlineIdsRaw.some(id => ids.includes(id));
-        const seenOffline = offlineIdsRaw.some(id => ids.includes(id));
-        if (!seenOnline && !seenOffline) offlineIdsRaw.push(...ids);
+        const seen = onlineIdsRaw.concat(offlineIdsRaw);
+        if (!seen.some(id => ids.includes(id))) offlineIdsRaw.push(...ids);
       }
 
-      // === Batch único via CTE ===
       const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
       const r = await sql/*sql*/`
         WITH
@@ -248,8 +223,7 @@ export async function runUptimeBinanceOnce() {
       statusToOnline += Number(r?.[0]?.on_count  || 0);
       statusToOffline+= Number(r?.[0]?.off_count || 0);
 
-      const coverage = list.length ? (onlineIdsRaw.length / list.length) : 0;
-      console.log(`[uptime:binance] account=${userName} algo=${algo} miners=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${offlineIdsRaw.length} cover=${(coverage*100).toFixed(1)}%`);
+      console.log(`[uptime:binance] account=${userName} algo=${algo} miners=${list.length} onlineAPI=${onlineIdsRaw.length} offlineAPI=${offlineIdsRaw.length}`);
     }
 
     for (const [key, list] of groups.entries()) {
@@ -259,13 +233,11 @@ export async function runUptimeBinanceOnce() {
     }
     await Promise.allSettled(Array.from(running));
 
-    console.log(`[uptime:binance] slot=${sISO} groups=${groupsCount} miners=${miners.length} api=${apiCalls} +hrs=${hoursUpdated} statusOn=${statusToOnline} statusOff=${statusToOffline}`);
+    console.log(`[uptime:binance] slot=${sISO} groups=${groupsCount} api=${apiCalls} +hrs=${hoursUpdated} statusOn=${statusToOnline} statusOff=${statusToOffline}`);
     return { ok: true, groups: groupsCount, updated: hoursUpdated, statusChanged: statusToOnline + statusToOffline };
   } catch (e) {
     console.error("⛔ uptime:binance", e);
     return { ok: false, error: String(e?.message || e) };
-  } finally {
-    try { await sql/*sql*/`SELECT pg_advisory_unlock(${lockHigh}, ${lockLow})`; } catch {}
   }
 }
 
@@ -273,7 +245,7 @@ export function startUptimeBinance() {
   cron.schedule(
     "*/15 * * * *",
     async () => { try { await runUptimeBinanceOnce(); } catch (e) { console.error("⛔ binance cron:", e); } },
-    { timezone: "Europe/Lisbon" } // mantém igual aos outros jobs
+    { timezone: "Europe/Lisbon" }
   );
   console.log("[jobs] Binance (*/15) agendado.");
 }

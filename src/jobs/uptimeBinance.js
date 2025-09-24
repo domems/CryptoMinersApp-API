@@ -14,7 +14,7 @@ const CANDIDATE_BASES = [
   "https://api3.binance.com",
 ].filter(Boolean);
 
-/* ===== time slot (15 min, UTC) ===== */
+/* ===== slot 15 min (UTC) ===== */
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
   const q = m - (m % 15);
@@ -23,16 +23,11 @@ function slotISO(d = new Date()) {
 }
 
 /* ===== helpers ===== */
-const norm = (s) => String(s ?? "").trim();
-function clean(s) {
-  return String(s ?? "").normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
-}
-function mask(s, keep = 6) {
-  const t = String(s ?? "");
-  if (!t) return "";
-  if (t.length <= keep + 2) return `${t.slice(0, 2)}***`;
-  return t.slice(0, keep) + "***" + t.slice(-2);
-}
+const clean = (s) => String(s ?? "").normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+const mask  = (s, keep = 6) => {
+  const t = String(s ?? ""); if (!t) return "";
+  return t.length <= keep + 2 ? `${t.slice(0, 2)}***` : t.slice(0, keep) + "***" + t.slice(-2);
+};
 function mapAlgo(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC") return "sha256";
@@ -40,7 +35,7 @@ function mapAlgo(coin) {
   if (c === "KAS" || c === "KASPA") return "kHeavyHash";
   return "";
 }
-/** Extrai MiningAccount e Worker de "MiningAccount.Worker" (descarta se faltar o ponto). */
+/** extrai account & sufixo de "account.worker" */
 function splitAccountWorker(row) {
   const wn = clean(row.worker_name);
   const i = wn.indexOf(".");
@@ -53,20 +48,19 @@ function tail(s) {
   const i = str.lastIndexOf(".");
   return i >= 0 ? str.slice(i + 1) : str;
 }
-/** chave normalizada do worker: lowercase + sem zeros à esquerda (001 ≡ 1, preserva "0") */
+/** chave normalizada do sufixo: lowercase + sem zeros à esquerda (001 ≡ 1; preserva "0") */
 const workerKey = (w) => {
   const s = clean(w).toLowerCase();
   const k = s.replace(/^0+/, "");
   return k === "" ? "0" : k;
 };
 
-/* ===== Binance signed fetch ===== */
+/* ===== assinatura e fetch ===== */
 function signQuery(secret, params) {
   const qs = new URLSearchParams(params).toString();
   const sig = crypto.createHmac("sha256", secret).update(qs).digest("hex");
   return `${qs}&signature=${sig}`;
 }
-
 async function fetchWithRetry(url, opts = {}, retries = 2) {
   let attempt = 0;
   while (true) {
@@ -91,37 +85,22 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
     return resp;
   }
 }
-
-/** IP de saída do host (para debug de geoblock) */
-async function egressIP() {
-  try {
-    const r = await fetchWithRetry("https://api.ipify.org?format=text", { timeout: 6000 }, 0);
-    if (!r.ok) return "?";
-    return (await r.text()).trim();
-  } catch { return "?"; }
-}
-
-/** Escolhe a primeira base que responda 200 (não 451) */
 async function pickBinanceBase() {
   for (const base of CANDIDATE_BASES) {
     try {
-      const resp = await fetchWithRetry(`${base}/api/v3/exchangeInfo`, { timeout: 7000 }, 1);
-      if (resp.ok) return { base, status: resp.status };
-      if (resp.status === 451) {
-        console.warn("[uptime:binance] base geoblocked:", base);
-        continue;
-      }
+      const r = await fetchWithRetry(`${base}/api/v3/exchangeInfo`, { timeout: 7000 }, 1);
+      if (r.ok) return { base, status: r.status };
+      if (r.status === 451) { console.warn("[uptime:binance] base geoblocked:", base); continue; }
     } catch {}
   }
   return { base: null, status: 0 };
 }
 
-/** Lista todos os workers (paginate) */
+/* ===== API Binance ===== */
 async function binanceListWorkers({ base, apiKey, secretKey, algo, userName }) {
   const headers = { "X-MBX-APIKEY": apiKey };
   const pageSize = 200;
-  let page = 1;
-  const all = [];
+  let page = 1, all = [];
 
   while (true) {
     const params = { algo, userName, pageIndex: page, sort: 0, timestamp: Date.now(), recvWindow: 10_000 };
@@ -136,59 +115,29 @@ async function binanceListWorkers({ base, apiKey, secretKey, algo, userName }) {
 
     const data = await resp.json().catch(() => null);
     const arr = data?.data?.workerDatas || [];
-
     all.push(...arr);
+
     const pageSizeResp = Number(data?.data?.pageSize || 0);
     if (!arr.length || arr.length < (pageSizeResp || pageSize)) break;
     page += 1;
   }
 
+  // normalizar o que precisamos
   const workers = all.map(w => ({
-    workerName: clean(w?.workerName),
-    status: Number(w?.status ?? 0),        // 1 valid, 2 invalid, 3 no longer valid
+    workerName: clean(w?.workerName),                 // pode vir "account.worker"
+    status: Number(w?.status ?? 0),                   // 1 valid, 2 invalid, 3 no longer valid
     hashRate: Number(w?.hashRate ?? 0),
     lastShareTime: Number(w?.lastShareTime ?? 0),
   }));
 
   return { ok: true, status: 200, workers };
 }
-
-/** Detalhe de um worker (diagnóstico) — tenta "sufixo" e "account.sufixo" */
-async function binanceWorkerDetail({ base, apiKey, secretKey, algo, userName, workerName }) {
-  const headers = { "X-MBX-APIKEY": apiKey };
-
-  async function call(name) {
-    const params = { algo, userName, workerName: name, timestamp: Date.now(), recvWindow: 10_000 };
-    const url = `${base}/sapi/v1/mining/worker/detail?` + signQuery(secretKey, params);
-    const resp = await fetchWithRetry(url, { headers }, 2);
-    if (!resp.ok) return null;
-    const data = await resp.json().catch(() => null);
-    const d = data?.data;
-    if (!d) return null;
-    return {
-      workerName: clean(d.workerName ?? name),
-      status: Number(d.status ?? 0),
-      hashRate: Number(d.hashRate ?? 0),
-      lastShareTime: Number(d.lastShareTime ?? 0),
-    };
-  }
-
-  // 1) tenta sufixo tal como veio da BD; 2) tenta "account.sufixo"
-  const tries = [workerName, `${userName}.${workerName}`];
-  for (const name of tries) {
-    const r = await call(name);
-    if (r) return r;
-  }
-  return null;
-}
-
-/** Online se hashRate > 0 OU status==1 */
 function isOnlineBinance(w) {
   if (Number.isFinite(w.hashRate) && w.hashRate > 0) return true;
   return Number(w.status) === 1;
 }
 
-/* ===== slot dedupe (in-process) ===== */
+/* ===== controle de slot (dedupe horas) ===== */
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
@@ -200,14 +149,15 @@ function dedupeForHours(ids) {
 
 /* ===== Job principal ===== */
 export async function runUptimeBinanceOnce() {
+  const t0 = Date.now();
   const sISO = slotISO();
   beginSlot(sISO);
 
-  // Lock distribuído (20 min para cobrir desvios)
+  // lock do slot (14m chega e sobra)
   const lockKey = `uptime:${sISO}:binance`;
-  const gotRedis = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 });
-  if (!gotRedis) {
-    console.log(`[uptime:binance] lock ativo (${sISO}) – skip`);
+  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
+  if (!gotLock) {
+    console.log(`[uptime:binance] lock ativo (${sISO}) – ignorado nesta instância.`);
     return { ok: true, skipped: true };
   }
 
@@ -218,26 +168,28 @@ export async function runUptimeBinanceOnce() {
   let apiCalls = 0;
 
   try {
-    // Escolhe base alcançável
     const picked = await pickBinanceBase();
     if (!picked.base) {
-      const ip = await egressIP();
-      console.warn("[uptime:binance] Todas as bases geoblocked ou indisponíveis (provável 451).", { egressIP: ip });
+      console.warn("[uptime:binance] todas as bases indisponíveis/geoblocked.");
       return { ok: true, skipped: true, reason: "geoblocked_all" };
     }
     const BASE = picked.base;
     console.log("[uptime:binance] BASE escolhida:", BASE);
 
+    // miners desta pool com credenciais válidas
     const minersRaw = await sql/*sql*/`
-      SELECT id, worker_name, api_key, secret_key, coin, status
+      SELECT id, worker_name, api_key, secret_key, coin
       FROM miners
       WHERE pool = 'Binance'
         AND api_key IS NOT NULL AND secret_key IS NOT NULL
         AND worker_name IS NOT NULL
     `;
-    if (!minersRaw.length) return { ok: true, updated: 0, statusChanged: 0 };
+    if (!minersRaw.length) {
+      console.log(`[uptime:binance] ${sISO} groups=0 miners=0 api=0 online(+hrs)=0 statusOn=0 statusOff=0 dur=${Date.now()-t0}ms`);
+      return { ok: true, updated: 0, statusChanged: 0 };
+    }
 
-    // Normaliza e valida (exige account.worker e algo válido)
+    // normaliza: exige "account.worker" + algo
     const miners = minersRaw
       .map(r => {
         const { account, worker } = splitAccountWorker(r);
@@ -246,18 +198,8 @@ export async function runUptimeBinanceOnce() {
       })
       .filter(m => m.account && m.worker && m.algo);
 
-    const discarded = minersRaw.filter(r => {
-      const { account, worker } = splitAccountWorker(r);
-      return !(account && worker && mapAlgo(r.coin));
-    });
-    if (discarded.length) {
-      console.warn("[uptime:binance] DESCARTADOS:", discarded.map(x => ({
-        id: x.id, worker_name: x.worker_name, coin: x.coin
-      })));
-    }
-
-    // Agrupa por credenciais + account + algo
-    const groups = new Map();
+    // agrupar por credenciais + account + algo (exatamente como a API exige)
+    const groups = new Map(); // "api|secret|account|algo" -> Miner[]
     for (const m of miners) {
       const k = `${m.api_key}|${m.secret_key}|${m.account}|${m.algo}`;
       if (!groups.has(k)) groups.set(k, []);
@@ -265,175 +207,101 @@ export async function runUptimeBinanceOnce() {
     }
     groupsCount = groups.size;
 
-    const CONC = 3;
-    const running = new Set();
-
-    async function processGroup(key, list) {
+    for (const [key, list] of groups) {
       try {
         const [apiKey, secretKey, userName, algo] = key.split("|");
 
-        // Mapas: wk(normalizado do sufixo) -> [ids], e meta com sufixos originais
-        const want = new Map();               // wkSuffix -> ids[]
-        const wantMeta = new Map();           // wkSuffix -> { suffixes: Set<string> }
+        // mapear sufixos desejados -> ids
+        const suffixToIds = new Map();  // wkSuffixNorm -> [ids]
+        const allIds = [];
         for (const m of list) {
-          const wkSuffix = workerKey(m.worker); // ex.: "001" -> "1"
-          if (!wkSuffix) continue;
-          if (!want.has(wkSuffix)) want.set(wkSuffix, []);
-          want.get(wkSuffix).push(m.id);
-
-          if (!wantMeta.has(wkSuffix)) wantMeta.set(wkSuffix, { suffixes: new Set() });
-          wantMeta.get(wkSuffix).suffixes.add(m.worker); // guarda sufixo(s) originais ("001")
+          allIds.push(m.id);
+          const sfxNorm = workerKey(m.worker); // "001" -> "1"
+          if (!sfxNorm) continue;
+          if (!suffixToIds.has(sfxNorm)) suffixToIds.set(sfxNorm, []);
+          suffixToIds.get(sfxNorm).push(m.id);
         }
 
         console.log("[uptime:binance] GROUP START", {
           account: userName, algo, miners: list.length,
           apiKey: mask(apiKey), secretKey: mask(secretKey),
-          wantWorkers: Array.from(want.keys()),
+          wantWorkers: Array.from(suffixToIds.keys()),
           base: BASE,
         });
 
+        // chama API
         const { ok, status, reason, workers } = await binanceListWorkers({ base: BASE, apiKey, secretKey, algo, userName });
         apiCalls += 1;
-
         if (!ok) {
-          // geoblock / auth / http -> não marcar offline
-          const ip = await egressIP();
-          console.warn("[uptime:binance] GROUP SKIPPED", { account: userName, algo, reason, httpStatus: status, egressIP: ip, base: BASE });
-          return;
+          console.warn("[uptime:binance] GROUP SKIPPED", { account: userName, algo, reason, httpStatus: status, base: BASE });
+          continue; // não marca offline em falha de API
         }
 
-        // classificar
-        let onlineIdsRaw = [];
-        let offlineIdsRaw = [];
-        let offlineExplicit = 0;
-        let offlineMissing  = 0;
-
-        // 1) workers devolvidos
+        // classificar: casa por SUFIXO do nome devolvido pela API
+        const onlineIdsRaw = [];
         for (const w of workers) {
-          // ⚠️ A Binance pode devolver "account.worker" → casa pelo SUFIXO
-          const k = workerKey(tail(w.workerName)); // usa só o que vem depois do último "."
-          if (!want.has(k)) continue;
-          const ids = want.get(k);
-          if (isOnlineBinance(w)) onlineIdsRaw.push(...ids);
-          else { offlineIdsRaw.push(...ids); offlineExplicit += ids.length; }
-        }
-
-        // 2) os que pedimos e NÃO vieram → tenta detail; só depois marca offline
-        const seen = new Set([...onlineIdsRaw, ...offlineIdsRaw]);
-        for (const [wkSuffix, ids] of want.entries()) {
-          const touched = ids.some(id => seen.has(id));
-          if (touched) continue;
-
-          // tenta detail com o sufixo original e com "account.sufixo"
-          const suffixes = Array.from((wantMeta.get(wkSuffix)?.suffixes ?? new Set()));
-          let detail = null;
-          for (const sfx of suffixes) {
-            detail = await binanceWorkerDetail({
-              base: BASE, apiKey, secretKey, algo, userName, workerName: sfx
-            }).catch(() => null);
-            if (detail) break;
-
-            detail = await binanceWorkerDetail({
-              base: BASE, apiKey, secretKey, algo, userName, workerName: `${userName}.${sfx}`
-            }).catch(() => null);
-            if (detail) break;
-          }
-
-          if (detail && isOnlineBinance(detail)) {
-            onlineIdsRaw.push(...ids); // ativo mas não veio na list
-          } else {
-            offlineIdsRaw.push(...ids);
-            offlineMissing += ids.length;
+          const sufNorm = workerKey(tail(w.workerName) || w.workerName);
+          if (!suffixToIds.has(sufNorm)) continue;
+          if (isOnlineBinance(w)) {
+            onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
           }
         }
 
-        // 3) normaliza arrays e resolve conflitos (online tem prioridade SEMPRE)
-        const onlineIdsUnique  = Array.from(new Set(onlineIdsRaw.filter(v => v != null)));
-        const offlineIdsUnique = Array.from(new Set(offlineIdsRaw.filter(v => v != null)));
-        const onlineSet = new Set(onlineIdsUnique);
-        const offlineIdsEffective = offlineIdsUnique.filter(id => !onlineSet.has(id));
+        // offline = todos os ids do grupo que NÃO estão online (evita overlap)
+        const onlineSet = new Set(onlineIdsRaw);
+        const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 
-        // 4) dedupe por slot para horas
-        const onlineIdsForHours = dedupeForHours(onlineIdsUnique);
-
-        // 5) aplica na BD em 3 passos, impedindo overwrite
-        let incCount = 0, onCount = 0, offCount = 0;
-
-        // (a) quem ganhou horas fica online no MESMO UPDATE
+        // 1) Horas online (dedupe por slot)
+        const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
         if (onlineIdsForHours.length) {
+          await sql/*sql*/`
+            UPDATE miners
+            SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
+            WHERE id = ANY(${onlineIdsForHours})
+          `;
+          hoursUpdated += onlineIdsForHours.length;
+        }
+
+        // 2) Status (IS DISTINCT FROM para evitar writes inúteis)
+        if (onlineIdsRaw.length) {
           const r1 = await sql/*sql*/`
             UPDATE miners
-            SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25,
-                status = 'online',
-                updated_at = NOW()
-            WHERE id = ANY(${onlineIdsForHours})
-            RETURNING id
-          `;
-          incCount = r1.length;
-        }
-
-        // (b) quem está online mas não ganhou horas neste slot (já tinha sido contado)
-        const onlineResidual = onlineIdsUnique.filter(id => !onlineIdsForHours.includes(id));
-        if (onlineResidual.length) {
-          const r2 = await sql/*sql*/`
-            UPDATE miners
-            SET status = 'online',
-                updated_at = NOW()
-            WHERE id = ANY(${onlineResidual})
+            SET status = 'online'
+            WHERE id = ANY(${onlineIdsRaw})
               AND status IS DISTINCT FROM 'online'
             RETURNING id
           `;
-          onCount = r2.length;
+          statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
         }
-
-        // (c) offline só para quem NÃO esteve online neste ciclo
-        if (offlineIdsEffective.length) {
-          const r3 = await sql/*sql*/`
+        if (offlineIdsRaw.length) {
+          const r2 = await sql/*sql*/`
             UPDATE miners
-            SET status = 'offline',
-                updated_at = NOW()
-            WHERE id = ANY(${offlineIdsEffective})
+            SET status = 'offline'
+            WHERE id = ANY(${offlineIdsRaw})
               AND status IS DISTINCT FROM 'offline'
             RETURNING id
           `;
-          offCount = r3.length;
+          statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
         }
-
-        hoursUpdated   += incCount;
-        statusToOnline += onCount;
-        statusToOffline+= offCount;
 
         console.log("[uptime:binance] GROUP RESULT", {
           account: userName,
           algo,
           miners: list.length,
           apiWorkers: workers.length,
-          onlineAPI: onlineIdsUnique.length,
-          offlineAPI: offlineIdsUnique.length,
-          offlineEffective: offlineIdsEffective.length,
-          offlineExplicit,
-          offlineMissing,
-          inc: incCount,
-          statusOn: onCount,
-          statusOff: offCount,
-          onlineIdsForHours,
-          onlineResidual,
-          offlineIdsEffective,
+          onlineAPI: onlineIdsRaw.length,
+          offlineAPI: offlineIdsRaw.length,
+          inc: onlineIdsForHours.length,
+          statusOn: statusToOnline,
+          statusOff: statusToOffline,
         });
-      } catch (err) {
-        console.error("[uptime:binance] GROUP ERROR", String(err?.message || err));
+      } catch (e) {
+        console.error("[uptime:binance] GROUP ERROR", String(e?.message || e));
       }
     }
 
-    for (const [key, list] of groups.entries()) {
-      const p = processGroup(key, list).finally(() => running.delete(p));
-      running.add(p);
-      if (running.size >= CONC) await Promise.race(running);
-    }
-    await Promise.allSettled(Array.from(running));
-
-    console.log(`[uptime:binance] slot=${sISO} groups=${groupsCount} api=${apiCalls} +hrs=${hoursUpdated} statusOn=${statusToOnline} statusOff=${statusToOffline}`);
-    return { ok: true, groups: groupsCount, updated: hoursUpdated, statusChanged: statusToOnline + statusToOffline };
+    console.log(`[uptime:binance] ${sISO} groups=${groupsCount} api=${apiCalls} online(+hrs)=${hoursUpdated} statusOn=${statusToOnline} statusOff=${statusToOffline} dur=${Date.now()-t0}ms`);
+    return { ok: true, updated: hoursUpdated, statusChanged: statusToOnline + statusToOffline };
   } catch (e) {
     console.error("⛔ uptime:binance", e);
     return { ok: false, error: String(e?.message || e) };

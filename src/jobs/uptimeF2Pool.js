@@ -5,7 +5,7 @@ import dns from "dns";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
-/* ===== mata proxies marados e força IPv4-first ===== */
+/* ===== limpar proxies marados e forçar IPv4-first ===== */
 for (const k of ["HTTP_PROXY","http_proxy","HTTPS_PROXY","https_proxy","NO_PROXY","no_proxy"]) {
   if (process.env[k]) { console.warn(`[uptime:f2pool] ignorando ${k}=${process.env[k]}`); delete process.env[k]; }
 }
@@ -63,210 +63,101 @@ async function backoff(fn, tries = 3, base = 700) {
   throw lastErr;
 }
 
-/* ===== heurísticas agressivas p/ extrair campos quando a API muda o shape ===== */
-function guessNameFromObject(w) {
-  if (!w || typeof w !== "object") return "";
-  const entries = Object.entries(w);
-  const candidates = [];
-  for (const [k, v] of entries) {
-    if (typeof v !== "string") continue;
-    const s = clean(v);
-    if (!s) continue;
-    const lk = k.toLowerCase();
-    if (lk.includes("worker") || lk.includes("name") || lk === "id" || lk.endsWith("_id")) {
-      candidates.push(s);
-    }
-  }
-  candidates.sort((a, b) =>
-    (b.includes(".") - a.includes(".")) ||
-    ((/\d+$/.test(b)) - (/\d+$/.test(a))) ||
-    (b.length - a.length)
-  );
-  return candidates[0] || "";
-}
-function guessHashrateFromObject(w) {
-  let best = 0;
-  for (const [k, v] of Object.entries(w || {})) {
-    if (typeof v !== "number" || !isFinite(v)) continue;
-    const lk = k.toLowerCase();
-    if (lk.includes("hash") || lk.includes("rate") || lk === "hr" || lk.endsWith("_hr")) {
-      if (v > best) best = v;
-    }
-  }
-  return best;
-}
-function guessLastShareFromObject(w) {
-  for (const [k, v] of Object.entries(w || {})) {
-    const lk = k.toLowerCase();
-    if (!(lk.includes("last") && (lk.includes("share") || lk.includes("submit") || lk.includes("time") || lk.includes("ts")))) continue;
-    if (typeof v === "number" && isFinite(v)) return v;
-    if (typeof v === "string" && v) return v;
-  }
-  return null;
-}
-
-/* ===== normalizador -> [{ name, online }] ===== */
+/* ===== normalizador — AGORA com suporte ao shape v2: hash_rate_info.{name,hash_rate} ===== */
 function normalizeWorkersToOnline(list) {
   const out = [];
-  const push = (name, hashrate, lastShare, onlineHint) => {
+  const push = (name, hashrate, lastShareSecOrMs, onlineHint) => {
     const hr = Number(hashrate ?? 0);
+
+    // lastShare pode vir em segundos (ex.: last_share_at) — normaliza
     let last = null;
-    if (typeof lastShare === "number" && isFinite(lastShare)) {
-      last = lastShare > 1e11 ? new Date(lastShare) : new Date(lastShare*1000);
-    } else if (typeof lastShare === "string" && lastShare) {
-      const t = Date.parse(lastShare); if (!Number.isNaN(t)) last = new Date(t);
+    if (typeof lastShareSecOrMs === "number" && isFinite(lastShareSecOrMs)) {
+      last = lastShareSecOrMs > 1e11 ? new Date(lastShareSecOrMs) : new Date(lastShareSecOrMs * 1000);
+    } else if (typeof lastShareSecOrMs === "string" && lastShareSecOrMs) {
+      const t = Date.parse(lastShareSecOrMs); if (!Number.isNaN(t)) last = new Date(t);
     }
-    const fresh = last ? (Date.now() - last.getTime() < 90*60*1000) : false; // 90m
+
+    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90m
     const online = onlineHint === true ? true : (hr > 0 || fresh);
-    if (clean(name)) out.push({ name: clean(name), online }); // IGNORA entradas sem nome
+
+    const nm = clean(name);
+    if (nm) out.push({ name: nm, online });
   };
 
   for (const w of list || []) {
-    let name = clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "");
-    if (!name) name = guessNameFromObject(w);
+    // Shape v2 (teu sample): { hash_rate_info: { name, hash_rate, ... }, last_share_at, status, host }
+    const hri = w?.hash_rate_info || w?.hashrate_info || w?.hashRateInfo || null;
 
-    const hr = w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m
-            ?? w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr
-            ?? guessHashrateFromObject(w) ?? 0;
+    // Extrair nome
+    let name =
+      clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "") ||
+      clean(hri?.name ?? ""); // <—— AQUI está o teu "001"
 
-    const last = w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime
-              ?? w?.last_submit_time ?? w?.last_share_timestamp ?? guessLastShareFromObject(w) ?? null;
+    // Extrair hashrate
+    const hr =
+      w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m ??
+      w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr ??
+      hri?.hash_rate ?? hri?.hashRate ?? 0;
 
-    const hint = typeof w?.online === "boolean"
-      ? w.online
-      : (w?.worker_status && String(w.worker_status).toLowerCase() === "active")
-        || (String(w?.status ?? "").toLowerCase() === "active")
-        || (Number(w?.status) === 1);
+    // Extrair last share
+    const last =
+      w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime ??
+      w?.last_submit_time ?? w?.last_share_timestamp ?? w?.last_share_at ?? // <—— AQUI no v2
+      null;
+
+    // “status” numérico da F2Pool é inconsistente — ignora, usa HR/FRESH
+    const hint =
+      typeof w?.online === "boolean"
+        ? w.online
+        : (w?.worker_status && String(w.worker_status).toLowerCase() === "active") ||
+          (String(w?.status ?? "").toLowerCase() === "active") ||
+          (Number(w?.status) === 1);
 
     push(name, hr, last, !!hint);
   }
   return out;
 }
 
-/* ===== F2Pool v2 (token em miners.api_key) com paginação + validação de code + fallback v1 ===== */
+/* ===== F2Pool v2 (token em miners.api_key) — currency TEM de ser "bitcoin" para BTC ===== */
 async function f2poolV2Workers(account, coin, token) {
   if (!token) return { ok: false, status: 0, workers: [], endpoint: null, reason: "no_token" };
-  const headers = { "Content-Type": "application/json", "Accept": "application/json", "F2P-API-SECRET": token };
   const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
-  const size = 200;
-  const all = [];
-  let lastStatus = 0;
+  const headers = { "Content-Type": "application/json", "Accept": "application/json", "F2P-API-SECRET": token };
 
-  for (let page = 1; page <= 5; page++) {
-    const body = JSON.stringify({ currency: f2slug(coin), mining_user_name: account, page, size });
-    const { data, resp } = await backoff(() => tryJSON(url, { method: "POST", headers, body }, 15000, true), 2, 800);
-    lastStatus = resp.status;
+  const body = JSON.stringify({ currency: f2slug(coin), mining_user_name: account, page: 1, size: 200 });
+  const { data, resp } = await backoff(() => tryJSON(url, { method: "POST", headers, body }, 15000, true), 2, 800);
 
-    // 🚨 se backend devolve erro lógico (code!=0), falha v2 (não marcar offline)
-    if (data && typeof data.code === "number" && data.code !== 0) {
-      return { ok: false, status: lastStatus, workers: [], endpoint: url, reason: `v2_code_${data.code}`, msg: data.msg || "v2 logical error" };
-    }
-
-    const arr = Array.isArray(data?.workers) ? data.workers
-              : Array.isArray(data?.data?.workers) ? data.data.workers
-              : Array.isArray(data?.data?.list) ? data.data.list
-              : Array.isArray(data?.list) ? data.list
-              : Array.isArray(data?.result?.workers) ? data.result.workers
-              : Array.isArray(data?.result?.list) ? data.result.list
-              : Array.isArray(data?.items) ? data.items
-              : Array.isArray(data) ? data : [];
-    all.push(...arr);
-
-    const total = Number(data?.data?.total ?? data?.total ?? 0);
-    const hasMore = (arr.length === size) && (!total || page*size < total);
-    if (!hasMore) break;
+  // A v2 pode devolver 200 sem "code"; se trouxer "code" e for != 0, trata como falha lógica
+  if (data && typeof data.code === "number" && data.code !== 0) {
+    return { ok: false, status: resp.status, workers: [], endpoint: url, reason: `v2_code_${data.code}`, msg: data.msg || "logical error" };
   }
 
-  const workers = normalizeWorkersToOnline(all);
-  // Se a lista ficar vazia, não tratar como sucesso — estado desconhecido
+  const arr = Array.isArray(data?.workers) ? data.workers
+            : Array.isArray(data?.data?.workers) ? data.data.workers
+            : Array.isArray(data?.data?.list) ? data.data.list
+            : Array.isArray(data?.list) ? data.list
+            : Array.isArray(data?.result?.workers) ? data.result.workers
+            : Array.isArray(data?.result?.list) ? data.result.list
+            : Array.isArray(data?.items) ? data.items
+            : Array.isArray(data) ? data : [];
+
+  const workers = normalizeWorkersToOnline(arr);
+
+  // Se vier vazio, não marca offline — provavelmente permissão/params
   if (workers.length === 0) {
-    return { ok: false, status: lastStatus || 200, workers: [], endpoint: url, reason: "v2_empty" };
+    return { ok: false, status: resp.status, workers: [], endpoint: url, reason: "v2_empty" };
   }
-  return { ok: true, status: lastStatus || 200, workers, endpoint: url };
+
+  return { ok: true, status: resp.status, workers, endpoint: url };
 }
 
-/** sanity check opcional: info da conta/coin (devolve code/msg) */
-async function f2poolV2Info(account, coin, token) {
-  if (!token) return null;
-  try {
-    const { data } = await backoff(() => tryJSON(
-      "https://api.f2pool.com/v2/hash_rate/info",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json", "F2P-API-SECRET": token },
-        body: JSON.stringify({ currency: f2slug(coin), mining_user_name: account }),
-      },
-      12000, true
-    ), 2, 600);
-    return data || null;
-  } catch { return null; }
-}
-
-/** v1 pública (sem token): GET /{slug}/{account} */
-async function f2poolV1Workers(account, coin) {
-  const url = `https://api.f2pool.com/${f2slug(coin)}/${account}`;
-  try {
-    const { data, resp } = await backoff(
-      () => tryJSON(url, { method: "GET", headers: { "Accept": "application/json" } }, 12000, true),
-      2, 700
-    );
-    let arr = [];
-    if (Array.isArray(data?.workers)) {
-      if (Array.isArray(data.workers[0])) {
-        arr = data.workers.map(a => {
-          const name = clean(String(a[0] ?? ""));
-          const nums = a.filter(x => typeof x === "number");
-          const hr = nums.length ? Math.max(...nums) : 0;
-          const last = a.find(v => typeof v === "string" && /\d{4}-\d{2}-\d{2}T/.test(v))
-                    ?? a.find(v => typeof v === "number" && v > 1e9) ?? null;
-          const offlineFlag = typeof a[a.length - 1] === "boolean" ? a[a.length - 1] : undefined;
-          return { name, hashrate: hr, last_share: last, online: offlineFlag === undefined ? undefined : !offlineFlag };
-        });
-      } else {
-        arr = data.workers;
-      }
-    } else if (data?.workers && typeof data.workers === "object") {
-      arr = Object.entries(data.workers).map(([name, v]) => (typeof v === "number" ? { name, hashrate: v } : { name, ...v }));
-    } else if (Array.isArray(data?.miners)) {
-      arr = data.miners;
-    }
-    const workers = normalizeWorkersToOnline(arr);
-    if (workers.length === 0) return { ok: false, status: resp.status, workers: [], endpoint: url, reason: "v1_empty" };
-    return { ok: true, status: resp.status, workers, endpoint: url };
-  } catch (e) {
-    return { ok: false, status: e?.httpStatus || 0, workers: [], endpoint: url, reason: "v1_http", msg: String(e?.message || e) };
-  }
-}
-
-/** fetch unificado com fallback; só devolve ok=true quando há workers */
-async function fetchF2PoolWorkers(account, coin, token) {
-  const v2 = await f2poolV2Workers(account, coin, token);
-  if (v2.ok && v2.workers.length) return v2;
-
-  // Se v2 falhou, tenta v1
-  const v1 = await f2poolV1Workers(account, coin);
-  if (v1.ok && v1.workers.length) return v1;
-
-  // Log auxiliar com info() para diagnosticar perm/visibilidade
-  const info = await f2poolV2Info(account, coin, token).catch(() => null);
-  return {
-    ok: false,
-    status: v2.status || v1.status || 0,
-    workers: [],
-    endpoint: v2.endpoint || v1.endpoint || null,
-    error: v2.msg || v1.msg || v2.reason || v1.reason || "no_workers",
-    info_code: typeof info?.code === "number" ? info.code : undefined,
-    info_msg: info?.msg,
-  };
-}
-
-/* ===== dedupe horas por slot ===== */
+/* ===== dedupe +0.25 por slot ===== */
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
 function dedupeForHours(ids) { const out = []; for (const id of ids) if (!updatedInSlot.has(id)) { updatedInSlot.add(id); out.push(id); } return out; }
 
-/* ===== Job principal ===== */
+/* ===== Job ===== */
 export async function runUptimeF2PoolOnce() {
   const t0 = Date.now(); const sISO = slotISO(); beginSlot(sISO);
 
@@ -313,22 +204,19 @@ export async function runUptimeF2PoolOnce() {
 
         console.log("[uptime:f2pool] GROUP START", {
           account, coin, miners: list.length, wantWorkers: Array.from(suffixToIds.keys()),
-          auth: token ? "v2-token" : "v1-public"
+          auth: token ? "v2-token" : "no-token"
         });
 
-        const { ok, status, workers, endpoint, error, info_code, info_msg } = await fetchF2PoolWorkers(account, coin, token || undefined);
+        const { ok, status, workers, endpoint, reason, msg } = await f2poolV2Workers(account, coin, token || undefined);
         if (!ok) {
-          console.warn("[uptime:f2pool] GROUP SKIPPED", {
-            account, coin, httpStatus: status || 0, auth: token ? "v2-token" : "v1-public",
-            endpoint, error, info_code, info_msg
-          });
-          continue; // NÃO marca offline quando não há dados confiáveis
+          console.warn("[uptime:f2pool] GROUP SKIPPED", { account, coin, httpStatus: status || 0, endpoint, error: reason || msg || "unknown" });
+          continue; // NUNCA marcar offline sem dados de workers
         }
 
-        // snapshot (até 5) p/ ver match
+        // snapshot (até 5) para ver match
         const snap = workers.slice(0, 5).map(w => {
-          const name = w.name; const t = tail(name) || name; const k = workerKey(t);
-          return `${name} -> tail:${t} -> key:${k} -> online:${w.online ? 1 : 0}`;
+          const name = w.name; const t = tail(name) || name; const k2 = workerKey(t);
+          return `${name} -> tail:${t} -> key:${k2} -> online:${w.online ? 1 : 0}`;
         });
         console.log("[uptime:f2pool] API workers snapshot:", snap);
 
@@ -340,7 +228,7 @@ export async function runUptimeF2PoolOnce() {
           if (w.online) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
         }
 
-        // offline = todos do grupo que não ficaram online (apenas quando temos workers válidos)
+        // offline = todos do grupo que não ficaram online (só porque temos lista válida)
         const onlineSet = new Set(onlineIdsRaw);
         const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 

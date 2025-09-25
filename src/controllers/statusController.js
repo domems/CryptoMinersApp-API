@@ -47,6 +47,20 @@ function mapAlgo(coin) {
   if (c === "KAS" || c === "KASPA") return "kHeavyHash";
   return "";
 }
+/** slug da F2Pool para currency */
+function f2slug(coin) {
+  const c = String(coin ?? "").trim().toUpperCase();
+  if (c === "BTC" || c === "BITCOIN") return "bitcoin";
+  if (c === "BCH") return "bitcoin-cash";
+  if (c === "BSV") return "bitcoin-sv";
+  if (c === "LTC" || c === "LITECOIN") return "litecoin";
+  if (c === "KAS" || c === "KASPA") return "kaspa";
+  if (c === "CFX") return "conflux";
+  if (c === "ETC") return "ethereum-classic";
+  if (c === "DASH") return "dash";
+  if (c === "SC" || c === "SIA") return "sia";
+  return c.toLowerCase();
+}
 
 /* ========= HTTP util ========= */
 async function fetchJSON(url, opts = {}, retries = 1) {
@@ -229,6 +243,52 @@ export async function getMinerStatus(req, res) {
           });
         }
       }
+
+    } else if (pool === "F2Pool") {
+      // **** NOVO: suporte v2 com token em api_key; BTC => "bitcoin"
+      source = "F2Pool";
+      const { account } = splitAccountWorker(worker_name_db);
+      if (!account) return res.status(400).json({ error: "F2Pool requer worker_name no formato 'Conta.Worker'." });
+      const currency = f2slug(coin || "BTC"); // BTC -> "bitcoin", etc.
+
+      const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
+      const headers = {
+        "Content-Type": "application/json",
+        "F2P-API-SECRET": api_key, // token guardado em miners.api_key
+      };
+      const body = JSON.stringify({ currency, mining_user_name: account, page: 1, size: 200 });
+
+      const { res: r, json: data } = await fetchJSON(url, { method: "POST", headers, body, timeout: 15000 }, 1);
+      if (!r.ok) {
+        return res.status(502).json({ error: "Erro HTTP na API da F2Pool (v2)", detalhe: `HTTP ${r.status}` });
+      }
+      if (data && typeof data.code === "number" && data.code !== 0) {
+        // v2 pode devolver 200 com erro lógico
+        return res.status(502).json({ error: "Erro lógico na API da F2Pool (v2)", code: data.code, msg: data.msg });
+      }
+
+      // Shape real (teu sample): { workers: [ { hash_rate_info:{ name, hash_rate, ...}, last_share_at, status, host } ] }
+      const arr = Array.isArray(data?.workers) ? data.workers
+                : Array.isArray(data?.data?.workers) ? data.data.workers
+                : Array.isArray(data?.data?.list) ? data.data.list
+                : Array.isArray(data?.list) ? data.list
+                : [];
+
+      workers = arr.map((item) => {
+        const hri = item?.hash_rate_info || item?.hashrate_info || item?.hashRateInfo || {};
+        const name = clean(hri?.name ?? item?.name ?? item?.worker ?? "");
+        const hr = Number(hri?.hash_rate ?? item?.hash_rate ?? item?.hashrate ?? 0);
+        const last = Number(item?.last_share_at ?? item?.last_share ?? item?.last_share_time ?? 0);
+        const lastMs = Number.isFinite(last) ? (last > 1e11 ? last : last * 1000) : 0;
+        const fresh = lastMs > 0 && (Date.now() - lastMs < 90 * 60 * 1000); // 90 minutos
+        const online = hr > 0 || fresh;
+        return {
+          worker_name: name,                         // "001"
+          worker_status: online ? "active" : "unactive",
+          hashrate_10min: hr,                        // usa hash_rate como proxy
+        };
+      });
+
     } else {
       return res.status(400).json({ error: "Pool não suportada." });
     }

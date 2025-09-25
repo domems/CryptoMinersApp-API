@@ -20,40 +20,36 @@ function splitAccountWorker(row) {
   if (i <= 0) return { account: "", worker: "" };
   return { account: wn.slice(0, i), worker: wn.slice(i + 1) };
 }
-/** sufixo depois do último "." (mantém zeros à esquerda) */
 function tail(s) {
   const str = clean(s);
   const i = str.lastIndexOf(".");
   return i >= 0 ? str.slice(i + 1) : str;
 }
-/** chave normalizada do sufixo: lowercase + sem zeros à esquerda (001 ≡ 1; preserva "0") */
 const workerKey = (w) => {
   const s = clean(w).toLowerCase();
   const k = s.replace(/^0+/, "");
   return k === "" ? "0" : k;
 };
-/** coin -> slug f2pool */
 function f2slug(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC" || c === "BITCOIN") return "bitcoin";
-  if (c === "BCH" || c === "BCHN") return "bitcoin-cash";
+  if (c === "BCH") return "bitcoin-cash";
   if (c === "BSV") return "bitcoin-sv";
-  if (c === "LTC" || c === "LITECOIN") return "litecoin";
+  if (c === "LTC") return "litecoin";
   if (c === "KAS" || c === "KASPA") return "kaspa";
-  if (c === "CFX" || c === "CONFLUX") return "conflux";
+  if (c === "CFX") return "conflux";
   if (c === "ETC") return "ethereum-classic";
   if (c === "DASH") return "dash";
   if (c === "SC" || c === "SIA") return "sia";
   return c.toLowerCase();
 }
 
-/* ===== fetch util (timeout + retry) ===== */
+/* ===== fetch util (timeout + retry/backoff) ===== */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, { ...opts, signal: controller.signal });
-    return resp;
+    return await fetch(url, { ...opts, signal: controller.signal });
   } finally {
     clearTimeout(to);
   }
@@ -70,12 +66,12 @@ async function tryJSON(url, opts, timeoutMs, expectOK = true) {
   }
   return { resp, data };
 }
-async function backoff(fn, tries = 3, base = 600) {
+async function backoff(fn, tries = 3, base = 700) {
   let lastErr = null;
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      await new Promise(r => setTimeout(r, base * (i + 1) + Math.random() * 300));
+      await new Promise(r => setTimeout(r, base * (i + 1) + Math.random() * 200));
     }
   }
   throw lastErr;
@@ -93,24 +89,27 @@ function normalizeWorkersToOnline(list) {
       const t = Date.parse(lastShare);
       if (!Number.isNaN(t)) last = new Date(t);
     }
-    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90 min de folga
+    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90m
     const online = onlineHint === true ? true : (hr > 0 || fresh);
     out.push({ name: clean(name), online });
   };
   for (const w of list || []) {
-    const name = clean(w?.name ?? w?.worker ?? w?.workerName ?? "");
-    const hr = w?.hashrate ?? w?.hashrate_10min ?? w?.hashrate_1h ?? w?.h1 ?? w?.h24 ?? w?.hr ?? 0;
-    const last = w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime ?? null;
+    const name = clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "");
+    const hr = w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m
+            ?? w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr ?? 0;
+    const last = w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime
+              ?? w?.last_submit_time ?? w?.last_share_timestamp ?? null;
     const hint = typeof w?.online === "boolean"
       ? w.online
-      : (w?.worker_status && String(w.worker_status).toLowerCase() === "active") ? true : undefined;
-    push(name, hr, last, hint);
+      : (w?.worker_status && String(w.worker_status).toLowerCase() === "active")
+        || (String(w?.status ?? "").toLowerCase() === "active")
+        || (Number(w?.status) === 1);
+    push(name, hr, last, !!hint);
   }
   return out;
 }
 
-/* ===== F2Pool API ===== */
-/** v2 com token (miners.api_key) – endpoint correto */
+/* ===== F2Pool v2 (token em miners.api_key) com paginação + fallback v1 ===== */
 async function f2poolV2Workers(account, coin, token) {
   if (!token) return { ok: false, status: 0, workers: [], endpoint: null };
   const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
@@ -119,26 +118,47 @@ async function f2poolV2Workers(account, coin, token) {
     "Accept": "application/json",
     "F2P-API-SECRET": token,
   };
-  const body = JSON.stringify({ currency: f2slug(coin), mining_user_name: account });
 
-  try {
-    const { resp, data } = await backoff(
-      () => tryJSON(url, { method: "POST", headers, body }, 12000, true),
-      2, 700
-    );
+  const all = [];
+  const size = 200;
+  for (let page = 1; page <= 5; page++) {
+    const body = JSON.stringify({
+      currency: f2slug(coin),
+      mining_user_name: account,
+      page,
+      size
+    });
+    let data, resp;
+    try {
+      ({ resp, data } = await backoff(
+        () => tryJSON(url, { method: "POST", headers, body }, 12000, true),
+        2, 700
+      ));
+    } catch (e) {
+      return { ok: false, status: e?.httpStatus || 0, workers: [], endpoint: url, error: String(e?.message || e) };
+    }
+
     const arr = Array.isArray(data?.workers) ? data.workers
               : Array.isArray(data?.data?.workers) ? data.data.workers
-              : Array.isArray(data?.data) ? data.data
+              : Array.isArray(data?.data?.list) ? data.data.list
+              : Array.isArray(data?.list) ? data.list
               : Array.isArray(data?.result?.workers) ? data.result.workers
+              : Array.isArray(data?.result?.list) ? data.result.list
+              : Array.isArray(data?.items) ? data.items
+              : Array.isArray(data) ? data
               : [];
-    const workers = normalizeWorkersToOnline(arr);
-    return { ok: true, status: resp.status, workers, endpoint: url, raw: data };
-  } catch (e) {
-    return { ok: false, status: e?.httpStatus || 0, workers: [], endpoint: url, error: String(e?.message || e) };
+    all.push(...arr);
+
+    // heurística de paginação
+    const total = Number(data?.data?.total ?? data?.total ?? 0);
+    const hasMore = (arr.length === size) && (!total || page * size < total);
+    if (!hasMore) break;
   }
+
+  const workers = normalizeWorkersToOnline(all);
+  return { ok: true, status: 200, workers, endpoint: url };
 }
 
-/** v1 pública (sem token): GET /{slug}/{account} */
 async function f2poolV1Workers(account, coin) {
   const url = `https://api.f2pool.com/${f2slug(coin)}/${account}`;
   try {
@@ -171,13 +191,12 @@ async function f2poolV1Workers(account, coin) {
       arr = data.miners;
     }
     const workers = normalizeWorkersToOnline(arr);
-    return { ok: true, status: resp.status, workers, endpoint: url, raw: data };
+    return { ok: true, status: resp.status, workers, endpoint: url };
   } catch (e) {
     return { ok: false, status: e?.httpStatus || 0, workers: [], endpoint: url, error: String(e?.message || e) };
   }
 }
 
-/** fetch unificado com fallback */
 async function fetchF2PoolWorkers(account, coin, token) {
   const v2 = await f2poolV2Workers(account, coin, token);
   if (v2.ok) return v2;
@@ -201,7 +220,6 @@ export async function runUptimeF2PoolOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
-  // lock do slot (14m)
   const lockKey = `uptime:${sISO}:f2pool`;
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
   if (!gotLock) {
@@ -223,7 +241,6 @@ export async function runUptimeF2PoolOnce() {
       return { ok: true, updated: 0, statusChanged: 0 };
     }
 
-    // exige account.worker
     const miners = minersRaw
       .map(r => {
         const { account, worker } = splitAccountWorker(r);
@@ -231,8 +248,7 @@ export async function runUptimeF2PoolOnce() {
       })
       .filter(m => m.account && m.worker);
 
-    // agrupa por (account, coin, token)
-    const groupMap = new Map();
+    const groupMap = new Map(); // (account|coin|token) -> Miner[]
     for (const m of miners) {
       const key = `${m.account}|${m.coin ?? ""}|${m.token}`;
       if (!groupMap.has(key)) groupMap.set(key, []);
@@ -243,7 +259,6 @@ export async function runUptimeF2PoolOnce() {
     for (const [k, list] of groupMap.entries()) {
       const [account, coin, token] = k.split("|");
       try {
-        // map sufixo normalizado -> [ids]
         const suffixToIds = new Map();
         const allIds = [];
         for (const m of list) {
@@ -260,23 +275,33 @@ export async function runUptimeF2PoolOnce() {
           auth: token ? "v2-token" : "v1-public"
         });
 
-        // chama API (não marca offline se a API falhar)
         const { ok, status, workers, endpoint, error } = await fetchF2PoolWorkers(account, coin, token || undefined);
         if (!ok) {
           console.warn("[uptime:f2pool] GROUP SKIPPED", { account, coin, httpStatus: status || 0, auth: token ? "v2-token" : "v1-public", endpoint, error });
-          continue;
+          continue; // NÃO marcar offline em falha de API
         }
 
-        // classifica por SUFIXO (API pode devolver "account.worker")
+        // DEBUG: mostra 5 workers da API (nome→tail→key→online)
+        if ((workers?.length ?? 0) > 0) {
+          const snap = workers.slice(0, 5).map(w => {
+            const name = w.name;
+            const t = tail(name) || name;
+            const k = workerKey(t);
+            return `${name} -> tail:${t} -> key:${k} -> online:${w.online ? 1 : 0}`;
+          });
+          console.log("[uptime:f2pool] API workers snapshot:", snap);
+        } else {
+          console.log("[uptime:f2pool] API workers EMPTY for group", { account, coin, endpoint });
+        }
+
+        // classificar por SUFIXO (API pode devolver "account.worker")
         const onlineIdsRaw = [];
         for (const w of workers) {
           const sufNorm = workerKey(tail(w.name) || w.name);
           if (!suffixToIds.has(sufNorm)) continue;
-          // w.online já vem resolvido pelo normalizador
           if (w.online) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
         }
 
-        // offline = todos do grupo que não ficaram online
         const onlineSet = new Set(onlineIdsRaw);
         const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 
@@ -315,6 +340,7 @@ export async function runUptimeF2PoolOnce() {
 
         console.log("[uptime:f2pool] GROUP RESULT", {
           account, coin, endpoint,
+          apiWorkers: workers.length,
           onlineAPI: onlineIdsRaw.length,
           offlineAPI: offlineIdsRaw.length,
           inc: onlineIdsForHours.length

@@ -63,27 +63,82 @@ async function backoff(fn, tries = 3, base = 700) {
   throw lastErr;
 }
 
+/* ===== heurísticas agressivas de extração ===== */
+function guessNameFromObject(w) {
+  if (!w || typeof w !== "object") return "";
+  const entries = Object.entries(w);
+  const candidates = [];
+  for (const [k, v] of entries) {
+    if (typeof v !== "string") continue;
+    const s = clean(v);
+    if (!s) continue;
+    const lk = k.toLowerCase();
+    if (lk.includes("worker") || lk.includes("name") || lk === "id" || lk.endsWith("_id")) {
+      candidates.push(s);
+    }
+  }
+  // preferir algo com ".", ou com dígitos no fim (tipo 001), depois o mais longo
+  candidates.sort((a, b) =>
+    (b.includes(".") - a.includes(".")) ||
+    ((/\d+$/.test(b)) - (/\d+$/.test(a))) ||
+    (b.length - a.length)
+  );
+  return candidates[0] || "";
+}
+function guessHashrateFromObject(w) {
+  let best = 0;
+  for (const [k, v] of Object.entries(w || {})) {
+    if (typeof v !== "number" || !isFinite(v)) continue;
+    const lk = k.toLowerCase();
+    if (lk.includes("hash") || lk.includes("rate") || lk === "hr" || lk.endsWith("_hr")) {
+      if (v > best) best = v;
+    }
+  }
+  return best;
+}
+function guessLastShareFromObject(w) {
+  for (const [k, v] of Object.entries(w || {})) {
+    const lk = k.toLowerCase();
+    if (!(lk.includes("last") && (lk.includes("share") || lk.includes("submit") || lk.includes("time") || lk.includes("ts")))) continue;
+    if (typeof v === "number" && isFinite(v)) return v;
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
+}
+
 /* ===== normalizador -> [{ name, online }] ===== */
 function normalizeWorkersToOnline(list) {
   const out = [];
   const push = (name, hashrate, lastShare, onlineHint) => {
     const hr = Number(hashrate ?? 0);
     let last = null;
-    if (typeof lastShare === "number" && isFinite(lastShare)) last = lastShare > 1e11 ? new Date(lastShare) : new Date(lastShare*1000);
-    else if (typeof lastShare === "string" && lastShare) { const t = Date.parse(lastShare); if (!Number.isNaN(t)) last = new Date(t); }
+    if (typeof lastShare === "number" && isFinite(lastShare)) {
+      last = lastShare > 1e11 ? new Date(lastShare) : new Date(lastShare*1000);
+    } else if (typeof lastShare === "string" && lastShare) {
+      const t = Date.parse(lastShare); if (!Number.isNaN(t)) last = new Date(t);
+    }
     const fresh = last ? (Date.now() - last.getTime() < 90*60*1000) : false; // 90m
     const online = onlineHint === true ? true : (hr > 0 || fresh);
-    out.push({ name: clean(name), online });
+    if (clean(name)) out.push({ name: clean(name), online }); // IGNORA entradas sem nome
   };
+
   for (const w of list || []) {
-    const name = clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "");
-    const hr = w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m ?? w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr ?? 0;
-    const last = w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime ?? w?.last_submit_time ?? w?.last_share_timestamp ?? null;
+    let name = clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "");
+    if (!name) name = guessNameFromObject(w);
+
+    const hr = w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m
+            ?? w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr
+            ?? guessHashrateFromObject(w) ?? 0;
+
+    const last = w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime
+              ?? w?.last_submit_time ?? w?.last_share_timestamp ?? guessLastShareFromObject(w) ?? null;
+
     const hint = typeof w?.online === "boolean"
       ? w.online
       : (w?.worker_status && String(w.worker_status).toLowerCase() === "active")
         || (String(w?.status ?? "").toLowerCase() === "active")
         || (Number(w?.status) === 1);
+
     push(name, hr, last, !!hint);
   }
   return out;
@@ -231,7 +286,7 @@ export async function runUptimeF2PoolOnce() {
           continue; // NÃO marca offline quando API falha
         }
 
-        // snapshot (5 primeiros) para veres match rápido
+        // snapshot (5 primeiros) p/ ver match
         if ((workers?.length ?? 0) > 0) {
           const snap = workers.slice(0, 5).map(w => {
             const name = w.name; const t = tail(name) || name; const k = workerKey(t);

@@ -1,6 +1,7 @@
 import { startUptimeViaBTC } from "./uptimeViaBTC.js";
 import { startUptimeLTCPool } from "./uptimeLiteCoinPool.js";
 import { startUptimeBinance } from "./uptimeBinance.js";
+import { startUptimeF2Pool } from "./uptimeF2Pool.js";
 
 let started = false;
 
@@ -15,6 +16,7 @@ export function startAllJobs() {
   startUptimeViaBTC();
   startUptimeLTCPool();
   startUptimeBinance();
+  startUptimeF2Pool();
 
   // (opcional) fecho mensal
   import("./monthlyClose.js")

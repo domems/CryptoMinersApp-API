@@ -20,16 +20,19 @@ function splitAccountWorker(row) {
   if (i <= 0) return { account: "", worker: "" };
   return { account: wn.slice(0, i), worker: wn.slice(i + 1) };
 }
+/** sufixo depois do último "." (mantém zeros à esquerda) */
 function tail(s) {
   const str = clean(s);
   const i = str.lastIndexOf(".");
   return i >= 0 ? str.slice(i + 1) : str;
 }
+/** chave normalizada do sufixo: lowercase + sem zeros à esquerda (001 ≡ 1; preserva "0") */
 const workerKey = (w) => {
   const s = clean(w).toLowerCase();
   const k = s.replace(/^0+/, "");
   return k === "" ? "0" : k;
 };
+/** coin -> slug f2pool */
 function f2slug(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
   if (c === "BTC" || c === "BITCOIN") return "bitcoin";
@@ -44,39 +47,41 @@ function f2slug(coin) {
   return c.toLowerCase();
 }
 
-/* ===== fetch com timeout + retry (porque httpStatus:0 = erro/timeout) ===== */
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 8000) {
+/* ===== fetch util (timeout + retry) ===== */
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 12000) {
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+  const to = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(url, { ...opts, signal: controller.signal });
     return resp;
   } finally {
-    clearTimeout(t);
+    clearTimeout(to);
   }
 }
-async function fetchJSON(url, opts, timeoutMs, expect200 = true) {
+async function tryJSON(url, opts, timeoutMs, expectOK = true) {
   const resp = await fetchWithTimeout(url, opts, timeoutMs);
-  if (expect200 && !resp.ok) {
-    const text = await resp.text().catch(() => "");
+  const text = await resp.text().catch(() => "");
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+  if (expectOK && !resp.ok) {
     const err = new Error(`HTTP ${resp.status} ${resp.statusText} – ${text.slice(0, 200)}`);
     err.httpStatus = resp.status;
     throw err;
   }
-  return { resp, data: await resp.json().catch(() => null) };
+  return { resp, data };
 }
-async function tryFetchWithBackoff(fn, tries = 3, baseDelayMs = 500) {
+async function backoff(fn, tries = 3, base = 600) {
   let lastErr = null;
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      await new Promise(r => setTimeout(r, baseDelayMs * (i + 1) + Math.random() * 300));
+      await new Promise(r => setTimeout(r, base * (i + 1) + Math.random() * 300));
     }
   }
   throw lastErr;
 }
 
-/* ===== normalizador de workers → { name, online } ===== */
+/* ===== normalizador -> [{ name, online }] ===== */
 function normalizeWorkersToOnline(list) {
   const out = [];
   const push = (name, hashrate, lastShare, onlineHint) => {
@@ -88,7 +93,7 @@ function normalizeWorkersToOnline(list) {
       const t = Date.parse(lastShare);
       if (!Number.isNaN(t)) last = new Date(t);
     }
-    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90 min
+    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90 min de folga
     const online = onlineHint === true ? true : (hr > 0 || fresh);
     out.push({ name: clean(name), online });
   };
@@ -104,53 +109,41 @@ function normalizeWorkersToOnline(list) {
   return out;
 }
 
-/* ===== F2Pool API: v2 com token (miners.api_key) + fallback v1 pública ===== */
-// Docs: header F2P-API-SECRET e POST para /v2/{request_name}. :contentReference[oaicite:0]{index=0}
+/* ===== F2Pool API ===== */
+/** v2 com token (miners.api_key) – endpoint correto */
 async function f2poolV2Workers(account, coin, token) {
   if (!token) return { ok: false, status: 0, workers: [], endpoint: null };
-  const slug = f2slug(coin);
-  const headers = { "Content-Type": "application/json", "F2P-API-SECRET": token, "Accept": "application/json" };
+  const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "F2P-API-SECRET": token,
+  };
+  const body = JSON.stringify({ currency: f2slug(coin), mining_user_name: account });
 
-  // Tentamos alguns endpoints usuais; paramos no primeiro 200
-  const endpoints = [
-    "https://api.f2pool.com/v2/workers",
-    "https://api.f2pool.com/v2/miner/workers",
-    "https://api.f2pool.com/v2/worker/list",
-  ];
-
-  let lastStatus = 0, lastErr = "";
-  for (const url of endpoints) {
-    try {
-      const { data, resp } = await tryFetchWithBackoff(
-        () => fetchJSON(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ currency: slug, user_name: account }),
-        }, 8000, true),
-        2, 600
-      );
-      // tenta extrair array de workers em chaves comuns
-      const arr = Array.isArray(data?.workers) ? data.workers
-                : Array.isArray(data?.data?.workers) ? data.data.workers
-                : Array.isArray(data?.data) ? data.data
-                : Array.isArray(data?.result?.workers) ? data.result.workers
-                : [];
-      const workers = normalizeWorkersToOnline(arr);
-      return { ok: true, status: resp.status, workers, endpoint: url, raw: data };
-    } catch (e) {
-      lastStatus = e?.httpStatus || 0;
-      lastErr = String(e?.message || e);
-    }
+  try {
+    const { resp, data } = await backoff(
+      () => tryJSON(url, { method: "POST", headers, body }, 12000, true),
+      2, 700
+    );
+    const arr = Array.isArray(data?.workers) ? data.workers
+              : Array.isArray(data?.data?.workers) ? data.data.workers
+              : Array.isArray(data?.data) ? data.data
+              : Array.isArray(data?.result?.workers) ? data.result.workers
+              : [];
+    const workers = normalizeWorkersToOnline(arr);
+    return { ok: true, status: resp.status, workers, endpoint: url, raw: data };
+  } catch (e) {
+    return { ok: false, status: e?.httpStatus || 0, workers: [], endpoint: url, error: String(e?.message || e) };
   }
-  return { ok: false, status: lastStatus, workers: [], endpoint: null, error: lastErr };
 }
 
+/** v1 pública (sem token): GET /{slug}/{account} */
 async function f2poolV1Workers(account, coin) {
-  const slug = f2slug(coin);
-  const url = `https://api.f2pool.com/${slug}/${account}`;
+  const url = `https://api.f2pool.com/${f2slug(coin)}/${account}`;
   try {
-    const { data, resp } = await tryFetchWithBackoff(
-      () => fetchJSON(url, { method: "GET", headers: { "Accept": "application/json" } }, 8000, true),
+    const { resp, data } = await backoff(
+      () => tryJSON(url, { method: "GET", headers: { "Accept": "application/json" } }, 10000, true),
       2, 600
     );
 
@@ -184,15 +177,15 @@ async function f2poolV1Workers(account, coin) {
   }
 }
 
+/** fetch unificado com fallback */
 async function fetchF2PoolWorkers(account, coin, token) {
-  // 1) v2 com token; 2) fallback v1 pública
   const v2 = await f2poolV2Workers(account, coin, token);
   if (v2.ok) return v2;
   const v1 = await f2poolV1Workers(account, coin);
-  return v1.ok ? v1 : { ok: false, status: v1.status || v2.status || 0, workers: [], error: v1.error || v2.error };
+  return v1.ok ? v1 : { ok: false, status: v1.status || v2.status || 0, workers: [], endpoint: v2.endpoint, error: v1.error || v2.error };
 }
 
-/* ===== dedupe de horas por slot ===== */
+/* ===== dedupe horas por slot ===== */
 let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
@@ -208,6 +201,7 @@ export async function runUptimeF2PoolOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
+  // lock do slot (14m)
   const lockKey = `uptime:${sISO}:f2pool`;
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 14 * 60 });
   if (!gotLock) {
@@ -229,6 +223,7 @@ export async function runUptimeF2PoolOnce() {
       return { ok: true, updated: 0, statusChanged: 0 };
     }
 
+    // exige account.worker
     const miners = minersRaw
       .map(r => {
         const { account, worker } = splitAccountWorker(r);
@@ -236,7 +231,8 @@ export async function runUptimeF2PoolOnce() {
       })
       .filter(m => m.account && m.worker);
 
-    const groupMap = new Map(); // "account|coin|token"
+    // agrupa por (account, coin, token)
+    const groupMap = new Map();
     for (const m of miners) {
       const key = `${m.account}|${m.coin ?? ""}|${m.token}`;
       if (!groupMap.has(key)) groupMap.set(key, []);
@@ -247,11 +243,12 @@ export async function runUptimeF2PoolOnce() {
     for (const [k, list] of groupMap.entries()) {
       const [account, coin, token] = k.split("|");
       try {
+        // map sufixo normalizado -> [ids]
         const suffixToIds = new Map();
         const allIds = [];
         for (const m of list) {
           allIds.push(m.id);
-          const sfxNorm = workerKey(m.worker); // ex.: "001" -> "1"
+          const sfxNorm = workerKey(m.worker);
           if (!sfxNorm) continue;
           if (!suffixToIds.has(sfxNorm)) suffixToIds.set(sfxNorm, []);
           suffixToIds.get(sfxNorm).push(m.id);
@@ -263,10 +260,11 @@ export async function runUptimeF2PoolOnce() {
           auth: token ? "v2-token" : "v1-public"
         });
 
+        // chama API (não marca offline se a API falhar)
         const { ok, status, workers, endpoint, error } = await fetchF2PoolWorkers(account, coin, token || undefined);
         if (!ok) {
           console.warn("[uptime:f2pool] GROUP SKIPPED", { account, coin, httpStatus: status || 0, auth: token ? "v2-token" : "v1-public", endpoint, error });
-          continue; // NÃO marcar offline em falha de API
+          continue;
         }
 
         // classifica por SUFIXO (API pode devolver "account.worker")
@@ -274,11 +272,13 @@ export async function runUptimeF2PoolOnce() {
         for (const w of workers) {
           const sufNorm = workerKey(tail(w.name) || w.name);
           if (!suffixToIds.has(sufNorm)) continue;
+          // w.online já vem resolvido pelo normalizador
           if (w.online) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
         }
 
+        // offline = todos do grupo que não ficaram online
         const onlineSet = new Set(onlineIdsRaw);
-        const offlineIdsRaw = list.map(m => m.id).filter(id => !onlineSet.has(id));
+        const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 
         // 1) horas online (dedupe por slot)
         const onlineIdsForHours = dedupeForHours(onlineIdsRaw);

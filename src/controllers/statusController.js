@@ -62,6 +62,86 @@ function f2slug(coin) {
   return c.toLowerCase();
 }
 
+/* ===== Mining-Dutch helpers ===== */
+function mdSlug(coin) {
+  const c = String(coin ?? "").trim().toUpperCase();
+  if (c === "BTC") return "bitcoin";
+  if (c === "LTC") return "litecoin";
+  if (c === "DOGE") return "dogecoin";
+  return "";
+}
+function mdAlgo(coin) {
+  const c = String(coin ?? "").trim().toUpperCase();
+  if (c === "BTC") return "sha256";
+  if (c === "LTC" || c === "DOGE") return "scrypt";
+  return "";
+}
+function buildMDUrls({ coin, account_id, api_key }) {
+  const base = "https://www.mining-dutch.nl";
+  const algo = mdAlgo(coin);
+  const slug = mdSlug(coin);
+  const mk = (name) =>
+    `${base}/pools/${name}.php?page=api&action=getuserworkers&id=${encodeURIComponent(account_id)}&api_key=${encodeURIComponent(api_key)}`;
+
+  const urls = [];
+  if (algo) urls.push(mk(algo));     // sha256.php / scrypt.php
+  if (slug) urls.push(mk(slug));     // bitcoin.php / litecoin.php / dogecoin.php
+  // fallback cruzado (algoritmo inverso)
+  if (algo === "sha256") urls.push(mk("scrypt"));
+  if (algo === "scrypt") urls.push(mk("sha256"));
+  // último recurso
+  if (!algo && !slug) { urls.push(mk("sha256")); urls.push(mk("scrypt")); }
+  return urls;
+}
+/** parser robusto para getuserworkers da Mining-Dutch */
+function parseMDWorkersPayload(data) {
+  if (!data || typeof data !== "object") return [];
+  // formato típico no topo: { getuserworkers: { data: { miners: [...] } } }
+  const top = data.getuserworkers;
+  if (top && top.data) {
+    const miners = top.data.miners ?? top.data.workers ?? [];
+    if (Array.isArray(miners)) {
+      return miners.map((v, i) => ({
+        username: clean(v?.username ?? v?.worker ?? v?.name ?? String(i)),
+        alive: Number(v?.alive ?? 0),
+        hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+        status: clean(v?.status ?? ""),
+        minerGroup: clean(v?.minerGroup ?? ""),
+      }));
+    }
+    if (miners && typeof miners === "object") {
+      return Object.entries(miners).map(([k, v]) => ({
+        username: clean(v?.username ?? v?.worker ?? v?.name ?? k),
+        alive: Number(v?.alive ?? 0),
+        hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+        status: clean(v?.status ?? ""),
+        minerGroup: clean(v?.minerGroup ?? ""),
+      }));
+    }
+  }
+  // fallback muito genérico (não esperado mas seguro)
+  const node = data?.data?.workers ?? data?.workers ?? data?.data ?? null;
+  if (node && typeof node === "object" && !Array.isArray(node)) {
+    return Object.entries(node).map(([k, v]) => ({
+      username: clean(v?.username ?? v?.worker ?? v?.name ?? k),
+      alive: Number(v?.alive ?? 0),
+      hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+      status: clean(v?.status ?? ""),
+      minerGroup: clean(v?.minerGroup ?? ""),
+    }));
+  }
+  if (Array.isArray(node)) {
+    return node.map((v, i) => ({
+      username: clean(v?.username ?? v?.worker ?? v?.name ?? String(i)),
+      alive: Number(v?.alive ?? 0),
+      hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+      status: clean(v?.status ?? ""),
+      minerGroup: clean(v?.minerGroup ?? ""),
+    }));
+  }
+  return [];
+}
+
 /* ========= HTTP util ========= */
 async function fetchJSON(url, opts = {}, retries = 1) {
   let attempt = 0;
@@ -163,6 +243,7 @@ export async function getMinerStatus(req, res) {
         worker_status: w.worker_status,
         hashrate_10min: Number(w.hashrate_10min ?? 0),
       }));
+
     } else if (pool === "LiteCoinPool") {
       source = "LiteCoinPool";
       const url = `https://www.litecoinpool.org/api?api_key=${encodeURIComponent(api_key)}`;
@@ -175,6 +256,7 @@ export async function getMinerStatus(req, res) {
         worker_status: info.connected ? "active" : "unactive",
         hashrate_10min: Number((info.hash_rate ?? 0) * 1000), // kH/s -> H/s
       }));
+
     } else if (pool === "Binance") {
       source = "Binance";
       if (!secret_key) return res.status(400).json({ error: "Miner Binance sem secret_key." });
@@ -245,7 +327,7 @@ export async function getMinerStatus(req, res) {
       }
 
     } else if (pool === "F2Pool") {
-      // **** NOVO: suporte v2 com token em api_key; BTC => "bitcoin"
+      // **** v2 com token em api_key; BTC => "bitcoin"
       source = "F2Pool";
       const { account } = splitAccountWorker(worker_name_db);
       if (!account) return res.status(400).json({ error: "F2Pool requer worker_name no formato 'Conta.Worker'." });
@@ -263,11 +345,10 @@ export async function getMinerStatus(req, res) {
         return res.status(502).json({ error: "Erro HTTP na API da F2Pool (v2)", detalhe: `HTTP ${r.status}` });
       }
       if (data && typeof data.code === "number" && data.code !== 0) {
-        // v2 pode devolver 200 com erro lógico
         return res.status(502).json({ error: "Erro lógico na API da F2Pool (v2)", code: data.code, msg: data.msg });
       }
 
-      // Shape real (teu sample): { workers: [ { hash_rate_info:{ name, hash_rate, ...}, last_share_at, status, host } ] }
+      // Shape: { workers: [ { hash_rate_info:{ name, hash_rate }, last_share_at, ... } ] }
       const arr = Array.isArray(data?.workers) ? data.workers
                 : Array.isArray(data?.data?.workers) ? data.data.workers
                 : Array.isArray(data?.data?.list) ? data.data.list
@@ -288,6 +369,41 @@ export async function getMinerStatus(req, res) {
           hashrate_10min: hr,                        // usa hash_rate como proxy
         };
       });
+
+    } else if (pool === "MiningDutch") {
+      source = "MiningDutch";
+      const { account } = splitAccountWorker(worker_name_db);
+      if (!account) return res.status(400).json({ error: "MiningDutch requer worker_name no formato 'AccountId.Worker'." });
+
+      const urls = buildMDUrls({ coin, account_id: account, api_key });
+      let parsed = null;
+      let lastErr = null;
+
+      for (const url of urls) {
+        const { res: r, json, raw } = await fetchJSON(url, { timeout: 12000 }, 1);
+        if (!r.ok) {
+          lastErr = `HTTP ${r.status}`;
+          continue;
+        }
+        const list = parseMDWorkersPayload(json);
+        if (Array.isArray(list) && list.length >= 0) {
+          parsed = list;
+          break;
+        } else {
+          lastErr = `schema inesperado`;
+          // continua a tentar próximo URL
+        }
+      }
+
+      if (!parsed) {
+        return res.status(502).json({ error: "Erro na API da MiningDutch", detalhe: lastErr || "sem dados" });
+      }
+
+      workers = parsed.map((w, i) => ({
+        worker_name: String(w?.username ?? `w${i}`),
+        worker_status: (Number(w?.alive ?? 0) > 0 || Number(w?.hashrate ?? 0) > 0) ? "active" : "unactive",
+        hashrate_10min: Number(w?.hashrate ?? 0),
+      }));
 
     } else {
       return res.status(400).json({ error: "Pool não suportada." });

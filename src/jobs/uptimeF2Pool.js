@@ -63,71 +63,31 @@ async function backoff(fn, tries = 3, base = 700) {
   throw lastErr;
 }
 
-/* ===== normalizador — AGORA com suporte ao shape v2: hash_rate_info.{name,hash_rate} ===== */
-function normalizeWorkersToOnline(list) {
+/* ===== NORMALIZADOR — devolve { name, hr, statusCode, lastMs } ===== */
+function normalizeV2Workers(list) {
   const out = [];
-  const push = (name, hashrate, lastShareSecOrMs, onlineHint) => {
-    const hr = Number(hashrate ?? 0);
-
-    // lastShare pode vir em segundos (ex.: last_share_at) — normaliza
-    let last = null;
-    if (typeof lastShareSecOrMs === "number" && isFinite(lastShareSecOrMs)) {
-      last = lastShareSecOrMs > 1e11 ? new Date(lastShareSecOrMs) : new Date(lastShareSecOrMs * 1000);
-    } else if (typeof lastShareSecOrMs === "string" && lastShareSecOrMs) {
-      const t = Date.parse(lastShareSecOrMs); if (!Number.isNaN(t)) last = new Date(t);
-    }
-
-    const fresh = last ? (Date.now() - last.getTime() < 90 * 60 * 1000) : false; // 90m
-    const online = onlineHint === true ? true : (hr > 0 || fresh);
-
-    const nm = clean(name);
-    if (nm) out.push({ name: nm, online });
-  };
-
-  for (const w of list || []) {
-    // Shape v2 (teu sample): { hash_rate_info: { name, hash_rate, ... }, last_share_at, status, host }
-    const hri = w?.hash_rate_info || w?.hashrate_info || w?.hashRateInfo || null;
-
-    // Extrair nome
-    let name =
-      clean(w?.name ?? w?.worker ?? w?.worker_name ?? w?.workerName ?? "") ||
-      clean(hri?.name ?? ""); // <—— AQUI está o teu "001"
-
-    // Extrair hashrate
-    const hr =
-      w?.hashrate ?? w?.hash_rate ?? w?.hashrate_10min ?? w?.hashrate_10m ??
-      w?.hashrate_1h ?? w?.curr_hashrate ?? w?.h1 ?? w?.h24 ?? w?.hr ??
-      hri?.hash_rate ?? hri?.hashRate ?? 0;
-
-    // Extrair last share
-    const last =
-      w?.last_share ?? w?.last_share_time ?? w?.lastShare ?? w?.lastShareTime ??
-      w?.last_submit_time ?? w?.last_share_timestamp ?? w?.last_share_at ?? // <—— AQUI no v2
-      null;
-
-    // “status” numérico da F2Pool é inconsistente — ignora, usa HR/FRESH
-    const hint =
-      typeof w?.online === "boolean"
-        ? w.online
-        : (w?.worker_status && String(w.worker_status).toLowerCase() === "active") ||
-          (String(w?.status ?? "").toLowerCase() === "active") ||
-          (Number(w?.status) === 1);
-
-    push(name, hr, last, !!hint);
+  for (const it of list || []) {
+    const hri = it?.hash_rate_info || it?.hashrate_info || it?.hashRateInfo || {};
+    const name = clean(hri?.name ?? it?.name ?? it?.worker ?? "");
+    const hr = Number(hri?.hash_rate ?? it?.hash_rate ?? it?.hashrate ?? 0);
+    const lastRaw = Number(it?.last_share_at ?? it?.last_share ?? it?.last_share_time ?? 0);
+    const lastMs = Number.isFinite(lastRaw) ? (lastRaw > 1e11 ? lastRaw : lastRaw * 1000) : 0;
+    const statusCode = Number.isFinite(Number(it?.status)) ? Number(it.status) : NaN; // 0=online, 1=offline
+    if (name) out.push({ name, hr, statusCode, lastMs });
   }
   return out;
 }
 
-/* ===== F2Pool v2 (token em miners.api_key) — currency TEM de ser "bitcoin" para BTC ===== */
+/* ===== F2Pool v2 (token em miners.api_key) — BTC -> "bitcoin" ===== */
 async function f2poolV2Workers(account, coin, token) {
   if (!token) return { ok: false, status: 0, workers: [], endpoint: null, reason: "no_token" };
   const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
   const headers = { "Content-Type": "application/json", "Accept": "application/json", "F2P-API-SECRET": token };
-
   const body = JSON.stringify({ currency: f2slug(coin), mining_user_name: account, page: 1, size: 200 });
+
   const { data, resp } = await backoff(() => tryJSON(url, { method: "POST", headers, body }, 15000, true), 2, 800);
 
-  // A v2 pode devolver 200 sem "code"; se trouxer "code" e for != 0, trata como falha lógica
+  // 200 com erro lógico → falha (não marcar offline)
   if (data && typeof data.code === "number" && data.code !== 0) {
     return { ok: false, status: resp.status, workers: [], endpoint: url, reason: `v2_code_${data.code}`, msg: data.msg || "logical error" };
   }
@@ -136,18 +96,10 @@ async function f2poolV2Workers(account, coin, token) {
             : Array.isArray(data?.data?.workers) ? data.data.workers
             : Array.isArray(data?.data?.list) ? data.data.list
             : Array.isArray(data?.list) ? data.list
-            : Array.isArray(data?.result?.workers) ? data.result.workers
-            : Array.isArray(data?.result?.list) ? data.result.list
-            : Array.isArray(data?.items) ? data.items
-            : Array.isArray(data) ? data : [];
+            : [];
 
-  const workers = normalizeWorkersToOnline(arr);
-
-  // Se vier vazio, não marca offline — provavelmente permissão/params
-  if (workers.length === 0) {
-    return { ok: false, status: resp.status, workers: [], endpoint: url, reason: "v2_empty" };
-  }
-
+  const workers = normalizeV2Workers(arr);
+  if (!workers.length) return { ok: false, status: resp.status, workers: [], endpoint: url, reason: "v2_empty" };
   return { ok: true, status: resp.status, workers, endpoint: url };
 }
 
@@ -213,27 +165,33 @@ export async function runUptimeF2PoolOnce() {
           continue; // NUNCA marcar offline sem dados de workers
         }
 
-        // snapshot (até 5) para ver match
+        // snapshot (até 5) para ver match, HR e status
         const snap = workers.slice(0, 5).map(w => {
-          const name = w.name; const t = tail(name) || name; const k2 = workerKey(t);
-          return `${name} -> tail:${t} -> key:${k2} -> online:${w.online ? 1 : 0}`;
+          const k2 = workerKey(tail(w.name) || w.name);
+          return `${w.name} -> key:${k2} hr:${w.hr} status:${w.statusCode}`;
         });
         console.log("[uptime:f2pool] API workers snapshot:", snap);
 
-        // classificar por SUFIXO
+        // classificar: online visível (hr>0 OU status==0), horas só hr>0, offline se (hr==0 E status==1)
         const onlineIdsRaw = [];
+        const onlineIdsForHoursRaw = [];
+        const offlineIdsRaw = [];
+
         for (const w of workers) {
           const sufNorm = workerKey(tail(w.name) || w.name);
           if (!suffixToIds.has(sufNorm)) continue;
-          if (w.online) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
+
+          const hrOnline = Number(w.hr) > 0;
+          const statusOnline = Number(w.statusCode) === 0;     // 0 = online (F2Pool v2)
+          const definitelyOffline = Number(w.statusCode) === 1 && !hrOnline;
+
+          if (hrOnline || statusOnline) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
+          if (hrOnline) onlineIdsForHoursRaw.push(...(suffixToIds.get(sufNorm) || []));
+          if (definitelyOffline) offlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
         }
 
-        // offline = todos do grupo que não ficaram online (só porque temos lista válida)
-        const onlineSet = new Set(onlineIdsRaw);
-        const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
-
-        // 1) horas online (dedupe slot)
-        const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
+        // 1) horas online (dedupe slot) — SÓ hr>0
+        const onlineIdsForHours = dedupeForHours(onlineIdsForHoursRaw);
         if (onlineIdsForHours.length) {
           const r = await sql/*sql*/`
             UPDATE miners
@@ -244,7 +202,7 @@ export async function runUptimeF2PoolOnce() {
           hoursUpdated += (Array.isArray(r) ? r.length : (r?.count || 0));
         }
 
-        // 2) status (só quando difere)
+        // 2) status visível
         if (onlineIdsRaw.length) {
           const r1 = await sql/*sql*/`
             UPDATE miners

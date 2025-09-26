@@ -21,7 +21,7 @@ const head = (s) => { const str = norm(s); const i = str.indexOf("."); return i 
 function algoFromCoin(coin) {
   const c = String(coin || "").trim().toUpperCase();
   if (c === "BTC") return "sha256";
-  if (c === "LTC" || c === "DOGE") return "scrypt"; // DOGE é merged via scrypt
+  if (c === "LTC" || c === "DOGE") return "scrypt";
   return "";
 }
 function mapCoinSlug(coin) {
@@ -31,7 +31,6 @@ function mapCoinSlug(coin) {
   if (c === "DOGE") return "dogecoin";
   return "";
 }
-
 function buildCandidateUrls({ coin, account_id, api_key }) {
   const base = "https://www.mining-dutch.nl";
   const algo = algoFromCoin(coin);
@@ -42,20 +41,76 @@ function buildCandidateUrls({ coin, account_id, api_key }) {
   const urls = [];
   if (algo) urls.push(mk(algo));         // sha256.php / scrypt.php
   if (coinSlug) urls.push(mk(coinSlug)); // bitcoin.php / litecoin.php / dogecoin.php
-  // fallback cruzado se o primeiro falhar
   if (algo === "sha256") urls.push(mk("scrypt"));
   if (algo === "scrypt") urls.push(mk("sha256"));
-  // último recurso (casos exóticos)
   if (!algo && !coinSlug) urls.push(mk("sha256"), mk("scrypt"));
   return urls;
 }
 
 function isOnlineFromWorker(w) {
+  // Mining-Dutch: alive=1/0, hashrate number
+  const alive = Number(w?.alive ?? w?.online ?? 0);
+  if (!Number.isNaN(alive) && alive > 0) return true;
   const hr = Number(w?.hashrate ?? w?.hash ?? 0);
   if (!Number.isNaN(hr) && hr > 0) return true;
   const st = low(w?.status);
   if (st && ["alive","online","active","up","working","connected"].includes(st)) return true;
   return false;
+}
+
+/** parser robusto para os formatos da Mining-Dutch */
+function parseWorkersPayload(data) {
+  if (!data || typeof data !== "object") return null;
+
+  // 1) formato com chave topo "getuserworkers" (o teu log)
+  if (data.getuserworkers && data.getuserworkers.data) {
+    const miners = data.getuserworkers.data.miners || data.getuserworkers.data.workers || [];
+    if (Array.isArray(miners)) {
+      return miners.map((v, i) => ({
+        name: norm(v?.worker ?? v?.name ?? v?.username ?? String(i)),
+        username: norm(v?.username ?? v?.worker ?? v?.name ?? String(i)),
+        hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+        alive: Number(v?.alive ?? 0),
+        status: norm(v?.status ?? ""),
+        raw: v || {},
+      }));
+    }
+    if (miners && typeof miners === "object") {
+      return Object.entries(miners).map(([k, v]) => ({
+        name: norm(v?.worker ?? v?.name ?? v?.username ?? k),
+        username: norm(v?.username ?? v?.worker ?? v?.name ?? k),
+        hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+        alive: Number(v?.alive ?? 0),
+        status: norm(v?.status ?? ""),
+        raw: v || {},
+      }));
+    }
+  }
+
+  // 2) formatos genéricos que tentámos antes
+  const node = data?.data?.workers ?? data?.workers ?? data?.data ?? null;
+  if (node && typeof node === "object" && !Array.isArray(node)) {
+    return Object.entries(node).map(([k, v]) => ({
+      name: norm(v?.worker ?? v?.name ?? v?.username ?? k),
+      username: norm(v?.username ?? v?.worker ?? v?.name ?? k),
+      hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+      alive: Number(v?.alive ?? 0),
+      status: norm(v?.status ?? ""),
+      raw: v || {},
+    }));
+  }
+  if (Array.isArray(node)) {
+    return node.map((v, i) => ({
+      name: norm(v?.worker ?? v?.name ?? v?.username ?? String(i)),
+      username: norm(v?.username ?? v?.worker ?? v?.name ?? String(i)),
+      hashrate: Number(v?.hashrate ?? v?.hash ?? 0),
+      alive: Number(v?.alive ?? 0),
+      status: norm(v?.status ?? ""),
+      raw: v || {},
+    }));
+  }
+
+  return null;
 }
 
 async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
@@ -70,29 +125,20 @@ async function fetchMiningDutchWorkers({ coin, account_id, api_key }) {
         lastErr = new Error(`HTTP ${res.status}`);
         continue;
       }
-
       const data = await res.json().catch(() => null);
-      const node = data?.data?.workers ?? data?.workers ?? data?.data ?? null;
-
-      let entries = [];
-      if (node && typeof node === "object" && !Array.isArray(node)) {
-        entries = Object.entries(node);
-      } else if (Array.isArray(node)) {
-        entries = node.map((v, i) => [String(v?.name ?? v?.worker ?? i), v]);
-      } else {
+      const list = parseWorkersPayload(data);
+      if (!list) {
         console.warn("[miningdutch] schema inesperado", url, JSON.stringify(data)?.slice(0, 300));
         continue;
       }
-
-      return entries.map(([k, v]) => {
-        const obj = (v && typeof v === "object") ? v : {};
-        return {
-          name: norm(obj.worker ?? obj.name ?? k),
-          hashrate: Number(obj.hashrate ?? obj.hash ?? 0),
-          status: norm(obj.status ?? ""),
-          raw: obj,
-        };
-      });
+      // normalização final (usar username como nome se existir)
+      return list.map((w) => ({
+        name: norm(w.name || w.username),
+        hashrate: Number(w.hashrate || 0),
+        status: norm(w.status || (Number(w.alive) > 0 ? "alive" : "")),
+        alive: Number(w.alive || 0),
+        raw: w.raw || {},
+      }));
     } catch (e) {
       lastErr = e;
       console.warn("[miningdutch] erro", url, e?.message || e);
@@ -120,9 +166,8 @@ export async function runUptimeMiningDutchOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
 
-  // lock por slot para evitar instâncias a duplicar trabalho
   const lockKey = `uptime:${sISO}:miningdutch`;
-  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 }); // 20 min
+  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 20 * 60 });
   if (!gotLock) {
     console.log(`[uptime:miningdutch] lock ativo (${sISO}) – skip.`);
     return { ok: true, skipped: true };
@@ -133,7 +178,6 @@ export async function runUptimeMiningDutchOnce() {
   let statusToOffline = 0;
 
   try {
-    // busca miners desta pool
     const miners = await sql/*sql*/`
       SELECT id, worker_name, api_key, coin
       FROM miners
@@ -143,10 +187,11 @@ export async function runUptimeMiningDutchOnce() {
     `;
     if (!miners.length) return { ok: true, updated: 0, statusChanged: 0 };
 
-    // agrupa por (api_key + account_id + coin)
+    // IMPORTANTE: se alteraste o worker_name na BD para "ACCOUNT_ID.tail" (p.ex. "241903.001"),
+    // o head() dá o account_id correto, e o tail() continua a ser o "001".
     const groups = new Map();
     for (const m of miners) {
-      const account_id = head(m.worker_name); // prefixo antes do "."
+      const account_id = head(m.worker_name);
       const key = `${m.api_key}::${account_id}::${m.coin || ""}`;
       if (!groups.has(key)) groups.set(key, { account_id, api_key: m.api_key, coin: m.coin, list: [] });
       groups.get(key).list.push(m);
@@ -160,20 +205,19 @@ export async function runUptimeMiningDutchOnce() {
       try {
         const workers = await fetchMiningDutchWorkers({ coin, account_id, api_key });
 
-        // index por tail (lowercase)
+        // index por tail (lowercase). Mining-Dutch usa "username" como tail (ex.: "001")
         const byTail = new Map();
-        for (const w of workers) byTail.set(low(tail(w.name)), w);
+        for (const w of workers) byTail.set(low(tail(w.name) || w.name), w);
 
         for (const m of list) {
           const t = low(tail(m.worker_name));
           const info = byTail.get(t);
           const apiOnline = !!(info && isOnlineFromWorker(info));
           if (apiOnline) onlineIdsRaw.push(m.id);
-          else offlineIdsRaw.push(m.id); // sem info ou offline -> offline
+          else offlineIdsRaw.push(m.id);
         }
       } catch (e) {
         console.error("[uptime:miningdutch] erro grupo", { account_id, coin }, e?.message || e);
-        // falhou a conta → marca todos como offline para este slot
         for (const m of list) offlineIdsRaw.push(m.id);
       }
 

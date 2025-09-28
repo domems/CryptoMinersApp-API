@@ -1,93 +1,90 @@
-// scripts/backfillMinerState.js
-import { sql } from "../src/config/db.js";
+// src/scripts/backfillMinerState.js
+import { sql } from "../config/db.js";
 
-/** ====== config ====== */
+const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
+
 const SLOT_MIN = 15;
-const OFFLINE_GRACE_MIN = 30; // minutos
+const OFFLINE_GRACE_MIN = 30;
 
-function decideState({ lastSeenUtc, hashrate, minHashrate }) {
+function decideState({ lastSeenUtc, hashrate, minHashrate = 0 }) {
   const now = new Date();
-  const minsSinceSeen = (now - new Date(lastSeenUtc)) / 60000;
+  const seen = lastSeenUtc ? new Date(lastSeenUtc) : null;
+  const minsSinceSeen = seen ? (now - seen) / 60000 : Infinity;
 
-  if (!lastSeenUtc) return "STALE"; // nunca vimos dados
+  if (!seen) return "STALE";
   if (minsSinceSeen > SLOT_MIN + 1) return "STALE";
   if (Number(hashrate) <= 0) return "OFFLINE";
   if (minHashrate && Number(hashrate) < Number(minHashrate)) return "DEGRADED";
   return "ONLINE";
 }
 
+async function detectSlotTable() {
+  const candidates = ["miner_slots", "uptime_slots", "uptimeviabtc", "uptime_binance", "uptime_f2pool"];
+  for (const t of candidates) {
+    const r = asRows(await sql`SELECT to_regclass(${`public.${t}`}) AS t`);
+    if (r[0]?.t) return t;
+  }
+  const f = asRows(await sql`
+    SELECT table_name
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND column_name IN ('miner_id','slot_iso','hashrate')
+    GROUP BY table_name
+    HAVING COUNT(DISTINCT column_name) >= 3
+    ORDER BY table_name
+    LIMIT 1
+  `);
+  return f[0]?.table_name ?? null;
+}
+
 async function main() {
   console.log("[backfill] start");
 
-  // Tenta descobrir a tabela de slots que tens (preferimos miner_slots).
-  const { rows: slotTable } = await sql/*sql*/`
-    SELECT to_regclass('public.miner_slots') AS ms, to_regclass('public.uptime_slots') AS us
-  `;
-  const table =
-    slotTable[0]?.ms ? "miner_slots" :
-    slotTable[0]?.us ? "uptime_slots" :
-    null;
-
+  const table = await detectSlotTable();
   if (!table) {
-    console.error("✗ Não encontrei tabela de slots (esperava miner_slots ou uptime_slots). Cria-a primeiro.");
+    console.error("✗ Não encontrei tabela de slots (preciso de miner_id, slot_iso, hashrate).");
     process.exit(1);
   }
+  console.log(`[backfill] usando tabela: ${table}`);
 
-  // Puxa último slot por miner
-  const rows = await sql/*sql*/`
+  // ⚠️ Identificadores (nome da tabela) não podem ser parametrizados na tag => usa sql.query com string construída.
+  const q = `
     WITH last_slot AS (
-      SELECT s.miner_id,
-             s.slot_iso,
-             s.hashrate,
-             COALESCE(s.seen_at_utc, s.created_at_utc, NOW()) AS seen_at_utc,
+      SELECT s.miner_id, s.slot_iso, s.hashrate,
+             COALESCE(s.seen_at_utc, s.created_at_utc, s.created_at, NOW()) AS seen_at_utc,
              ROW_NUMBER() OVER (PARTITION BY s.miner_id ORDER BY s.slot_iso DESC) AS rn
-      FROM ${sql(table)} s
+      FROM ${table} s
     )
-    SELECT m.id               AS miner_id,
-           m.user_id,
-           m.worker_name,
-           COALESCE(p.min_hashrate, 0)  AS min_hashrate,
-           COALESCE(p.offline_grace_min, ${OFFLINE_GRACE_MIN}) AS offline_grace_min,
-           ls.slot_iso,
-           ls.hashrate,
-           ls.seen_at_utc
+    SELECT m.id AS miner_id, ls.slot_iso, ls.hashrate, ls.seen_at_utc
     FROM miners m
     LEFT JOIN last_slot ls ON ls.miner_id = m.id AND ls.rn = 1
-    LEFT JOIN user_notification_prefs p ON p.user_id = m.user_id AND p.miner_id = m.id
     ORDER BY m.id
   `;
+  const rows = asRows(await sql.query(q));
 
   let upserts = 0, missing = 0;
   for (const r of rows) {
-    if (!r.slot_iso) { missing++; continue; }
+    if (!r?.slot_iso) { missing++; continue; }
 
-    // aplica “graça” para não marcar OFFLINE demasiado cedo
-    let next = decideState({
-      lastSeenUtc: r.seen_at_utc,
-      hashrate: r.hashrate,
-      minHashrate: r.min_hashrate
-    });
-
+    let next = decideState({ lastSeenUtc: r.seen_at_utc, hashrate: r.hashrate });
     const now = new Date();
     const minsSinceSeen = (now - new Date(r.seen_at_utc)) / 60000;
-    if (next === "OFFLINE" && minsSinceSeen < Number(r.offline_grace_min || OFFLINE_GRACE_MIN)) {
-      next = "STALE";
-    }
+    if (next === "OFFLINE" && minsSinceSeen < OFFLINE_GRACE_MIN) next = "STALE";
 
-    await sql/*sql*/`
+    await sql`
       INSERT INTO miner_state (miner_id, current_state, stable_since_utc, last_change_utc, last_seen_utc, last_hashrate, flap_count)
       VALUES (${r.miner_id}, ${next}, ${r.seen_at_utc}, ${r.seen_at_utc}, ${r.seen_at_utc}, ${r.hashrate || 0}, 0)
       ON CONFLICT (miner_id) DO UPDATE
-      SET current_state      = EXCLUDED.current_state,
-          last_change_utc    = EXCLUDED.last_change_utc,
-          stable_since_utc   = EXCLUDED.stable_since_utc,
-          last_seen_utc      = EXCLUDED.last_seen_utc,
-          last_hashrate      = EXCLUDED.last_hashrate
+      SET current_state    = EXCLUDED.current_state,
+          last_change_utc  = EXCLUDED.last_change_utc,
+          stable_since_utc = EXCLUDED.stable_since_utc,
+          last_seen_utc    = EXCLUDED.last_seen_utc,
+          last_hashrate    = EXCLUDED.last_hashrate
     `;
     upserts++;
   }
 
-  console.log(`[backfill] upserts=${upserts}, sem_slots=${missing}, table=${table}`);
+  console.log(`[backfill] upserts=${upserts}, sem_slots=${missing}`);
   process.exit(0);
 }
 

@@ -11,6 +11,8 @@ import invoicesRoutes from "./routes/invoices.js";
 import paymentsRoutes from "./routes/payments.js";
 import minersAdminRoutes from "./routes/minersAdminRoutes.js";
 import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
+import notificationsRouter from "./routes/notifications.js";
+import pushRouter from "./routes/push.js";
 
 import { clerkMiddleware } from "@clerk/express";
 import authRouter from "./routes/auth.js";
@@ -38,7 +40,9 @@ app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
-app.use("/api/admin", adminOnly, adminInvoicesRouter);
+app.use("/api", notificationsRouter);
+app.use("/api", pushRouter);
+
 
 // bootstrap de roles
 app.use("/api/auth", authRouter);
@@ -46,6 +50,7 @@ app.use("/api/auth", authRouter);
 // ---- rotas ADMIN (protegidas) ----
 // ✅ monta em /api/admin (um único /admin no caminho)
 app.use("/api/admin", adminOnly, minersAdminRoutes);
+app.use("/api/admin", adminOnly, adminInvoicesRouter);
 
 // raiz/health
 app.get("/", (_req, res) => res.send("Its working"));

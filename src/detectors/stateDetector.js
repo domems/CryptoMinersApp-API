@@ -5,16 +5,24 @@ const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
 /** Canonical: ONLINE | OFFLINE | STALE */
 function canonicalStateFromStatus(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
-  const ONLINE  = ["online","on","active","ativo","ativa","working","running","normal","ok","up","alive","mining","hashing"];
-  const OFFLINE = ["offline","off","inactive","inativo","inactiva","down","dead","stopped","error","erro","disabled","paused","fail","ko"];
-  if (ONLINE.some(k => s.includes(k))) return "ONLINE";
-  if (OFFLINE.some(k => s.includes(k))) return "OFFLINE";
+
+  // ajusta/expande estes termos se usares outros estados textuais
+  const ONLINE = [
+    "online","on","active","ativo","ativa","working","running","normal","ok","up","alive","mining","hashing","ligado"
+  ];
+  const OFFLINE = [
+    "offline","off","inactive","inativo","inactiva","down","dead","stopped","error","erro","disabled","paused","fail","ko","desligado"
+  ];
+
+  if (ONLINE.some((k) => s.includes(k))) return "ONLINE";
+  if (OFFLINE.some((k) => s.includes(k))) return "OFFLINE";
   return "STALE";
 }
 
-/** slot ISO (15m) p/ agrupar eventos */
+/** slot ISO (15m) para agrupar eventos/dedupe */
 function slotISO(d = new Date()) {
-  const m = d.getUTCMinutes(), q = m - (m % 15);
+  const m = d.getUTCMinutes();
+  const q = m - (m % 15);
   const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), q, 0));
   return t.toISOString();
 }
@@ -29,7 +37,7 @@ async function getCurrentState(minerId) {
 }
 
 export async function processMiner(minerId) {
-  // busca status + dono + worker
+  // buscar status + dono + worker (para payload)
   const minerRows = asRows(await sql`
     SELECT id, status, user_id, worker_name
     FROM miners
@@ -44,7 +52,7 @@ export async function processMiner(minerId) {
   const now = new Date();
   const sISO = slotISO(now);
 
-  // primeira vez: sem evento; só semear
+  // 1ª vez: sem evento; só semear estado
   if (!prev) {
     await sql`
       INSERT INTO miner_state (miner_id, current_state, stable_since_utc, last_change_utc, last_seen_utc, last_hashrate, flap_count)
@@ -58,12 +66,13 @@ export async function processMiner(minerId) {
     return { changed: false, from: null, to: next };
   }
 
+  // Sem mudança → só refresca last_seen
   if (prev === next) {
     await sql`UPDATE miner_state SET last_seen_utc = ${now} WHERE miner_id = ${minerId}`;
     return { changed: false, from: prev, to: next };
   }
 
-  // mudou → 1) evento  2) atualizar estado  3) outbox (inapp)
+  // Mudou → 1) evento  2) atualizar estado  3) enfileirar notificação (inapp + push)
   const shouldNotify =
     (prev !== "OFFLINE" && next === "OFFLINE") ||
     (prev !== "ONLINE"  && next === "ONLINE");
@@ -75,7 +84,7 @@ export async function processMiner(minerId) {
     ON CONFLICT DO NOTHING
   `;
 
-  // 2) atualizar estado atual
+  // 2) estado atual
   await sql`
     UPDATE miner_state
     SET current_state    = ${next},
@@ -85,10 +94,10 @@ export async function processMiner(minerId) {
     WHERE miner_id = ${minerId}
   `;
 
-  // 3) enfileirar notificação (idempotente por dedupe_key)
+  // 3) outbox
   if (shouldNotify) {
     const template = next === "OFFLINE" ? "miner_offline" : "miner_recovered";
-    const dedupeKey = `miner:${minerId}:${prev}->${next}:${sISO}`;
+    const baseKey = `miner:${minerId}:${prev}->${next}:${sISO}`;
     const payload = {
       minerId,
       worker: miner.worker_name || null,
@@ -97,11 +106,23 @@ export async function processMiner(minerId) {
       slot: sISO,
       atUtc: now.toISOString()
     };
+
+    // IN-APP
     await sql`
       INSERT INTO notification_outbox
         (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
       VALUES
-        (${dedupeKey}, 'user', ${miner.user_id}, 'inapp', ${template}, ${JSON.stringify(payload)}::jsonb)
+        (${baseKey}, 'user', ${miner.user_id}, 'inapp', ${template}, ${JSON.stringify(payload)}::jsonb)
+      ON CONFLICT (dedupe_key) DO NOTHING
+    `;
+
+    // PUSH
+    const pushKey = `${baseKey}:push`;
+    await sql`
+      INSERT INTO notification_outbox
+        (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
+      VALUES
+        (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
       ON CONFLICT (dedupe_key) DO NOTHING
     `;
   }

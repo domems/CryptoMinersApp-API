@@ -40,7 +40,7 @@ function parseBool(v) {
   const s = String(v).trim().toLowerCase();
   if (["1","true","t","yes","y","on"].includes(s)) return true;
   if (["0","false","f","no","n","off"].includes(s)) return false;
-  return undefined; // valor inválido => ignora (não altera)
+  return undefined;
 }
 
 const ORDER_BY_RECENTE = sql`COALESCE(created_at, CURRENT_TIMESTAMP) DESC, id DESC`;
@@ -187,7 +187,18 @@ export async function obterMinerPorId(req, res) {
       LIMIT 1
     `;
     if (!rows.length) return res.status(404).json({ error: "Miner não encontrada." });
-    res.json(rows[0]);
+
+    // Tenta enriquecer com owner_email (não explode se Clerk falhar)
+    const miner = rows[0];
+    let owner_email = null;
+    try {
+      // Se tiveres uma função resolveEmailByUserId, usa-a aqui.
+      // Como só temos resolveUserIdByEmail (email->id), não dá para inverter sem uma API extra.
+      // Devolvemos só user_id e owner_email = null. (O UI mostra "Current owner" só se vier)
+      owner_email = null;
+    } catch { /* ignore */ }
+
+    res.json({ ...miner, owner_email });
   } catch (err) {
     console.error("obterMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao obter miner." });
@@ -201,10 +212,11 @@ export async function patchMinerPorId(req, res) {
     if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
 
     // Confirma que existe
-    const exists = await sql/*sql*/`SELECT id FROM miners WHERE id = ${id} LIMIT 1`;
+    const exists = await sql/*sql*/`SELECT id, user_id, pool, api_key, secret_key FROM miners WHERE id = ${id} LIMIT 1`;
     if (!(Array.isArray(exists) ? exists.length : exists?.rows?.length)) {
       return res.status(404).json({ error: "Miner não encontrada." });
     }
+    const currentRow = Array.isArray(exists) ? exists[0] : exists.rows[0];
 
     // Helpers
     const normStr = (v) => {
@@ -230,7 +242,8 @@ export async function patchMinerPorId(req, res) {
     let {
       nome, modelo, hash_rate, preco_kw, consumo_kw_hora,
       worker_name, api_key, secret_key, coin, pool,
-      locked, // NOVO
+      locked, // pode vir do admin
+      user_email, owner_email, email, // <<< NOVO: aceitar qualquer um destes
     } = req.body || {};
 
     // Validações mínimas e normalizações
@@ -269,47 +282,90 @@ export async function patchMinerPorId(req, res) {
       // permitir limpar
     }
 
-    // Locked (boolean flexível)
-    const lockedParsed = parseBool(locked); // undefined => não altera; null => limpa? (não aplicável p/ boolean)
+    // Verifica se as colunas 'updated_at' e 'locked' existem
+    const [{ exists: hasUpdatedAt }] = await sql/*sql*/`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'miners' AND column_name = 'updated_at'
+      ) AS exists;
+    `;
+    const [{ exists: hasLocked }] = await sql/*sql*/`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'miners' AND column_name = 'locked'
+      ) AS exists;
+    `;
 
-    // Regra: se pool = Binance → api_key e secret_key obrigatórias quando mexe
+    // Validação Binance (considera valores finais)
     const willBePool = pool !== undefined ? pool : undefined;
     const willBeApi  = api_key !== undefined ? api_key : undefined;
     const willBeSec  = secret_key !== undefined ? secret_key : undefined;
 
     if ((willBePool === "Binance") || (willBeApi !== undefined) || (willBeSec !== undefined)) {
-      const [curr] = await sql/*sql*/`SELECT api_key, secret_key, pool FROM miners WHERE id = ${id} LIMIT 1`;
-      const finalPool = willBePool ?? curr?.pool ?? null;
-      const finalApi  = willBeApi  !== undefined ? willBeApi  : (curr?.api_key ?? null);
-      const finalSec  = willBeSec  !== undefined ? willBeSec  : (curr?.secret_key ?? null);
+      const finalPool = willBePool ?? currentRow?.pool ?? null;
+      const finalApi  = willBeApi  !== undefined ? willBeApi  : (currentRow?.api_key ?? null);
+      const finalSec  = willBeSec  !== undefined ? willBeSec  : (currentRow?.secret_key ?? null);
 
       if (finalPool === "Binance" && (!finalApi || !finalSec)) {
         return res.status(400).json({ error: "Para Binance, 'api_key' e 'secret_key' são obrigatórias." });
       }
     }
 
-    // Update com COALESCE (mantém valores não enviados)
+    // Reatribuição de dono via e-mail (Clerk)
+    let newUserId = undefined;
+    const targetEmail = [user_email, owner_email, email].map(v => (v ?? "")).find(v => String(v).trim() !== "");
+    if (targetEmail) {
+      try {
+        newUserId = await resolveUserIdByEmail(String(targetEmail).trim().toLowerCase());
+      } catch (e) {
+        const status = e?.status && e.status !== 200 ? e.status : 502;
+        const msg =
+          e?.status === 404
+            ? "Utilizador não encontrado (Clerk)."
+            : e?.status === 401 || e?.status === 403
+            ? "Falha na verificação com a Clerk (credenciais)."
+            : e?.message || "Erro na Clerk API.";
+        return res.status(status).json({ error: msg });
+      }
+    }
+
+    // Constrói dinamicamente o SET evitando colunas inexistentes e vírgulas a mais
+    const setParts = [];
+    setParts.push(sql`nome = COALESCE(${nome ?? null}, nome)`);
+    setParts.push(sql`modelo = COALESCE(${modelo ?? null}, modelo)`);
+    setParts.push(sql`hash_rate = COALESCE(${hash_rate ?? null}, hash_rate)`);
+    setParts.push(sql`preco_kw = COALESCE(${preco_kw ?? null}, preco_kw)`);
+    setParts.push(sql`consumo_kw_hora = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora)`);
+    setParts.push(sql`worker_name = COALESCE(${worker_name ?? null}, worker_name)`);
+    setParts.push(sql`api_key = COALESCE(${api_key ?? null}, api_key)`);
+    setParts.push(sql`secret_key = COALESCE(${secret_key ?? null}, secret_key)`);
+    setParts.push(sql`coin = COALESCE(${coin ?? null}, coin)`);
+    setParts.push(sql`pool = COALESCE(${pool ?? null}, pool)`);
+    if (newUserId !== undefined) {
+      setParts.push(sql`user_id = ${newUserId}`);
+    }
+
+    const lockedParsed = parseBool(locked);
+    if (hasLocked && lockedParsed !== undefined) {
+      setParts.push(sql`locked = ${lockedParsed}`);
+    }
+    if (hasUpdatedAt) {
+      setParts.push(sql`updated_at = NOW()`);
+    }
+
+    const setSql = setParts.reduce((acc, frag, idx) => (idx === 0 ? sql`${frag}` : sql`${acc}, ${frag}`), sql``);
+
     const [updated] = await sql/*sql*/`
       UPDATE miners
-      SET
-        nome             = COALESCE(${nome ?? null}, nome),
-        modelo           = COALESCE(${modelo ?? null}, modelo),
-        hash_rate        = COALESCE(${hash_rate ?? null}, hash_rate),
-        preco_kw         = COALESCE(${preco_kw ?? null}, preco_kw),
-        consumo_kw_hora  = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora),
-        worker_name      = COALESCE(${worker_name ?? null}, worker_name),
-        api_key          = COALESCE(${api_key ?? null}, api_key),
-        secret_key       = COALESCE(${secret_key ?? null}, secret_key),
-        coin             = COALESCE(${coin ?? null}, coin),
-        pool             = COALESCE(${pool ?? null}, pool),
-        ${lockedParsed !== undefined ? sql`locked = ${lockedParsed},` : sql``}
-        updated_at       = NOW()
+      SET ${setSql}
       WHERE id = ${id}
       RETURNING *;
     `;
 
     if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
-    return res.json({ ok: true, miner: updated });
+
+    // Opcional: devolve owner_email se tens maneira server-side de o obter. Mantemos null.
+    return res.json({ ok: true, miner: { ...updated, owner_email: null } });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });

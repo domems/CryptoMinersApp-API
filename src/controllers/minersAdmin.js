@@ -185,7 +185,7 @@ export async function obterMinerPorId(req, res) {
   }
 }
 
-// src/controllers/minersAdmin.js
+// PATCH /api/admin/miners/:id
 export async function patchMinerPorId(req, res) {
   try {
     const id = parseInt(String(req.params.id || ""), 10);
@@ -220,7 +220,7 @@ export async function patchMinerPorId(req, res) {
     // Extrai body
     let {
       nome, modelo, hash_rate, preco_kw, consumo_kw_hora,
-      worker_name, api_key, coin, pool,
+      worker_name, api_key, secret_key, coin, pool,
     } = req.body || {};
 
     // Validações mínimas e normalizações
@@ -231,19 +231,19 @@ export async function patchMinerPorId(req, res) {
     modelo          = normStr(modelo);
     worker_name     = normStr(worker_name);
     api_key         = normStr(api_key);
+    secret_key      = normStr(secret_key); // pode ser null para limpar
 
     // NUMERIC
     preco_kw        = normDec(preco_kw);
     consumo_kw_hora = normDec(consumo_kw_hora);
 
-    // hash_rate: TEXT (se a tua coluna for TEXT; se for NUMERIC, troca para normDec(hash_rate))
+    // hash_rate: TEXT no DB → trata como string
     if (hash_rate !== undefined) {
       hash_rate = hash_rate == null ? null : String(hash_rate).trim();
       if (hash_rate === "") hash_rate = null;
     }
 
     // Whitelists
-    const COIN_WHITELIST = ["BTC","BCH","XEC","LTC","ETC","ZEC","DASH","CKB","HNS","KAS"];
     if (coin !== undefined && coin !== null) {
       coin = String(coin).toUpperCase().trim();
       if (!COIN_WHITELIST.includes(coin)) return res.status(400).json({ error: "Moeda inválida." });
@@ -251,7 +251,7 @@ export async function patchMinerPorId(req, res) {
       // permitir limpar
     }
 
-    const POOL_WHITELIST = ["ViaBTC", "LiteCoinPool"];
+    const POOL_WHITELIST = ["ViaBTC", "LiteCoinPool", "Binance", "F2Pool", "MiningDutch"];
     if (pool !== undefined && pool !== null) {
       pool = String(pool).trim();
       if (!POOL_WHITELIST.includes(pool)) return res.status(400).json({ error: "Pool inválida." });
@@ -259,8 +259,25 @@ export async function patchMinerPorId(req, res) {
       // permitir limpar
     }
 
-    // Aqui aplicamos o mesmo padrão do “simples”: COALESCE(valor, coluna)
-    // Para colunas não enviadas, passamos NULL (=> mantém valor anterior)
+    // Regra: se pool = Binance → api_key e secret_key obrigatórias se algum destes campos for alterado
+    // (e também se a pool está a ser mudada para Binance)
+    const willBePool = pool !== undefined ? pool : undefined;         // undefined = não mexe
+    const willBeApi  = api_key !== undefined ? api_key : undefined;
+    const willBeSec  = secret_key !== undefined ? secret_key : undefined;
+
+    if ((willBePool === "Binance") || (willBeApi !== undefined) || (willBeSec !== undefined)) {
+      // Vamos ler o estado atual para validar corretamente
+      const [curr] = await sql/*sql*/`SELECT api_key, secret_key, pool FROM miners WHERE id = ${id} LIMIT 1`;
+      const finalPool = willBePool ?? curr?.pool ?? null;
+      const finalApi  = willBeApi  !== undefined ? willBeApi  : (curr?.api_key ?? null);
+      const finalSec  = willBeSec  !== undefined ? willBeSec  : (curr?.secret_key ?? null);
+
+      if (finalPool === "Binance" && (!finalApi || !finalSec)) {
+        return res.status(400).json({ error: "Para Binance, 'api_key' e 'secret_key' são obrigatórias." });
+      }
+    }
+
+    // Update com COALESCE (mantém valores não enviados)
     const [updated] = await sql/*sql*/`
       UPDATE miners
       SET
@@ -271,8 +288,10 @@ export async function patchMinerPorId(req, res) {
         consumo_kw_hora  = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora),
         worker_name      = COALESCE(${worker_name ?? null}, worker_name),
         api_key          = COALESCE(${api_key ?? null}, api_key),
+        secret_key       = COALESCE(${secret_key ?? null}, secret_key),
         coin             = COALESCE(${coin ?? null}, coin),
-        pool             = COALESCE(${pool ?? null}, pool)
+        pool             = COALESCE(${pool ?? null}, pool),
+        updated_at       = NOW()
       WHERE id = ${id}
       RETURNING *;
     `;
@@ -284,6 +303,3 @@ export async function patchMinerPorId(req, res) {
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });
   }
 }
-
-
-

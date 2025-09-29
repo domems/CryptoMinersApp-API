@@ -285,8 +285,8 @@ export async function assignStoreMinerToUser(req, res) {
     const {
       email,
       quantity = 1,
-      worker_pattern,         // ex: "acc.001", "acc", "001"
-      nome,                   // overrides opcionais
+      worker_pattern,
+      nome,
       modelo,
       hash_rate,
       consumo_kw_hora,
@@ -294,13 +294,18 @@ export async function assignStoreMinerToUser(req, res) {
       coin,
       pool,
       api_key,
+      secret_key, // <<< LÊ DO BODY
     } = req.body;
 
     if (!email || !email.trim()) {
       return res.status(400).json({ error: "Email é obrigatório." });
     }
 
-    // 1) Resolve user_id via Clerk
+    // opcional: força pools válidas
+    const ALLOWED_POOLS = new Set(["ViaBTC", "LiteCoinPool", "Binance", "F2Pool", "MiningDutch"]);
+    const usePool = pool && ALLOWED_POOLS.has(pool) ? pool : null;
+
+    // Clerk
     let user_id;
     try {
       user_id = await resolveUserIdByEmail(email.trim());
@@ -314,41 +319,43 @@ export async function assignStoreMinerToUser(req, res) {
       return res.status(e.status && e.status !== 200 ? e.status : 502).json({ error: msg });
     }
 
-    // 2) Buscar máquina da loja
+    // Loja
     const [sm] = await sql`SELECT * FROM store_miners WHERE id = ${id} LIMIT 1;`;
     if (!sm) return res.status(404).json({ error: "Máquina da loja não encontrada." });
 
-    // 3) Defaults a partir da loja + overrides do body (com decimais corretos)
+    // Defaults + overrides
     const baseNome   = (nome ?? sm.nome) || "Miner";
     const useModelo  = (modelo ?? sm.modelo) || null;
-    const useHash    = (hash_rate ?? sm.hash_rate) || null; // texto
+    const useHash    = (hash_rate ?? sm.hash_rate) || null;
 
-    // <<<<<<<<<<<<<<<< AQUI ESTÁ A CORREÇÃO >>>>>>>>>>>>>>>>
-    const useConsumo = parseDecimalFlexible(
-      consumo_kw_hora ?? sm.consumo_kw
-    );
+    const useConsumo = parseDecimalFlexible(consumo_kw_hora ?? sm.consumo_kw);
     const usePreco   = parseDecimalFlexible(preco_kw);
 
     const useCoin    = (coin || sm.coin || null);
-    const usePool    = pool || null;
     const useApiKey  = api_key || null;
+
+    // Regras: Binance precisa de api+secret; outras não guardam secret
+    const useSecretKey = usePool === "Binance" ? (secret_key || null) : null;
 
     if (!Number.isFinite(useConsumo) || !Number.isFinite(usePreco)) {
       return res.status(400).json({ error: "Valores numéricos inválidos (consumo/preço)." });
+    }
+
+    if (usePool === "Binance" && (!useApiKey || !useSecretKey)) {
+      return res.status(400).json({ error: "Para Binance, api_key e secret_key são obrigatórias." });
     }
 
     const qty = Math.max(1, Number(quantity) || 1);
     const workers = generateWorkerList(worker_pattern, qty);
 
     let created = 0;
-    const failed = []; // { index, reason }
+    const failed = [];
 
     for (let i = 0; i < qty; i++) {
       const worker_name = workers[i];
       const nomeSeq = `${baseNome}${qty > 1 ? ` #${String(i + 1).padStart(2, "0")}` : ""}`;
 
       try {
-        // Duplicados só se houver worker_name (se for null, permitimos múltiplos iguais)
         if (worker_name) {
           const [dup] = await sql`
             SELECT 1 FROM miners
@@ -358,10 +365,7 @@ export async function assignStoreMinerToUser(req, res) {
               AND worker_name = ${worker_name}
             LIMIT 1
           `;
-          if (dup) {
-            failed.push({ index: i, reason: "duplicate" });
-            continue;
-          }
+          if (dup) { failed.push({ index: i, reason: "duplicate" }); continue; }
         }
 
         await sql`
@@ -378,7 +382,7 @@ export async function assignStoreMinerToUser(req, res) {
             ${useConsumo},
             NOW(),
             0,
-            ${useApiKey}, NULL,
+            ${useApiKey}, ${useSecretKey},   -- <<< DEIXA DE SER NULL
             ${useCoin},
             ${usePool}
           )
@@ -396,3 +400,4 @@ export async function assignStoreMinerToUser(req, res) {
     return res.status(500).json({ error: "Erro ao atribuir máquina ao utilizador." });
   }
 }
+

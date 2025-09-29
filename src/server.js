@@ -13,6 +13,7 @@ import minersAdminRoutes from "./routes/minersAdminRoutes.js";
 import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
 import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
+import prefsRouter from "./routes/prefs.js";
 
 import { clerkMiddleware } from "@clerk/express";
 import authRouter from "./routes/auth.js";
@@ -42,6 +43,7 @@ app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
 app.use("/api", notificationsRouter);
 app.use("/api", pushRouter);
+app.use("/api", prefsRouter);
 
 
 // bootstrap de roles

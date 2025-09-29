@@ -34,6 +34,15 @@ function normalizeDecimal(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+function parseBool(v) {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (["1","true","t","yes","y","on"].includes(s)) return true;
+  if (["0","false","f","no","n","off"].includes(s)) return false;
+  return undefined; // valor inválido => ignora (não altera)
+}
+
 const ORDER_BY_RECENTE = sql`COALESCE(created_at, CURRENT_TIMESTAMP) DESC, id DESC`;
 
 /* =========================
@@ -221,6 +230,7 @@ export async function patchMinerPorId(req, res) {
     let {
       nome, modelo, hash_rate, preco_kw, consumo_kw_hora,
       worker_name, api_key, secret_key, coin, pool,
+      locked, // NOVO
     } = req.body || {};
 
     // Validações mínimas e normalizações
@@ -259,14 +269,15 @@ export async function patchMinerPorId(req, res) {
       // permitir limpar
     }
 
-    // Regra: se pool = Binance → api_key e secret_key obrigatórias se algum destes campos for alterado
-    // (e também se a pool está a ser mudada para Binance)
-    const willBePool = pool !== undefined ? pool : undefined;         // undefined = não mexe
+    // Locked (boolean flexível)
+    const lockedParsed = parseBool(locked); // undefined => não altera; null => limpa? (não aplicável p/ boolean)
+
+    // Regra: se pool = Binance → api_key e secret_key obrigatórias quando mexe
+    const willBePool = pool !== undefined ? pool : undefined;
     const willBeApi  = api_key !== undefined ? api_key : undefined;
     const willBeSec  = secret_key !== undefined ? secret_key : undefined;
 
     if ((willBePool === "Binance") || (willBeApi !== undefined) || (willBeSec !== undefined)) {
-      // Vamos ler o estado atual para validar corretamente
       const [curr] = await sql/*sql*/`SELECT api_key, secret_key, pool FROM miners WHERE id = ${id} LIMIT 1`;
       const finalPool = willBePool ?? curr?.pool ?? null;
       const finalApi  = willBeApi  !== undefined ? willBeApi  : (curr?.api_key ?? null);
@@ -291,6 +302,7 @@ export async function patchMinerPorId(req, res) {
         secret_key       = COALESCE(${secret_key ?? null}, secret_key),
         coin             = COALESCE(${coin ?? null}, coin),
         pool             = COALESCE(${pool ?? null}, pool),
+        ${lockedParsed !== undefined ? sql`locked = ${lockedParsed},` : sql``}
         updated_at       = NOW()
       WHERE id = ${id}
       RETURNING *;

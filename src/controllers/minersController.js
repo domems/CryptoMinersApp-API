@@ -7,6 +7,15 @@ const adminEmails = ["domems@gmail.com", "admin2@email.com"].map((e) =>
   String(e).trim().toLowerCase()
 );
 
+function parseBool(v) {
+  if (v === undefined) return undefined;
+  if (v === null || v === "") return null;
+  const s = String(v).trim().toLowerCase();
+  if (["1","true","t","yes","y","on"].includes(s)) return true;
+  if (["0","false","f","no","n","off"].includes(s)) return false;
+  return undefined;
+}
+
 /** "0,08" -> 0.08 ; "", null, undefined -> null ; lança em caso inválido */
 function normalizeDecimal(input) {
   if (input === undefined || input === null || input === "") return null;
@@ -14,7 +23,20 @@ function normalizeDecimal(input) {
     if (!Number.isFinite(input)) throw new Error(`Valor numérico inválido: "${input}"`);
     return input;
   }
-  const s = String(input).trim().replace(/\s+/g, "").replace(/\./g, "").replace(",", ".");
+  const s0 = String(input).trim().replace(/\s+/g, "");
+  // aceita "1.234,56" ou "1,234.56"
+  let s = s0;
+  const hasComma = s.includes(",");
+  const hasDot   = s.includes(".");
+  if (hasComma && hasDot) {
+    const lastComma = s.lastIndexOf(",");
+    const lastDot   = s.lastIndexOf(".");
+    const decSep = lastComma > lastDot ? "," : ".";
+    const thouSep = decSep === "," ? /\./g : /,/g;
+    s = s.replace(thouSep, "").replace(decSep, ".");
+  } else if (hasComma) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  }
   const n = Number(s);
   if (!Number.isFinite(n)) throw new Error(`Valor numérico inválido: "${input}"`);
   return n;
@@ -35,6 +57,7 @@ export const criarMiner = async (req, res) => {
     secret_key,
     coin,
     pool,
+    locked, // opcional no body; default = true
   } = req.body || {};
 
   try {
@@ -54,10 +77,12 @@ export const criarMiner = async (req, res) => {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
+    const lockedVal = (typeof locked === "boolean") ? locked : true;
+
     const [novoMiner] = await sql`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
-        worker_name, api_key, secret_key, coin, pool
+        worker_name, api_key, secret_key, coin, pool, locked
       ) VALUES (
         ${user_id},
         ${nomeClean},
@@ -70,7 +95,8 @@ export const criarMiner = async (req, res) => {
         ${api_key ? String(api_key).trim() : null},
         ${secret_key ? String(secret_key).trim() : null},
         ${coin ? String(coin).trim() : null},
-        ${pool ? String(pool).trim() : null}
+        ${pool ? String(pool).trim() : null},
+        ${lockedVal}
       )
       RETURNING *;
     `;
@@ -81,20 +107,43 @@ export const criarMiner = async (req, res) => {
   }
 };
 
-/* ========== Atualização por cliente (campos lógicos, opcionais) ========== */
-/* Atualiza só o que vier; usa COALESCE para não sobrescrever com NULL */
+/* ========== Atualização por cliente (apenas campos do cliente) ========== */
+/* Regra: se locked=true → 423 Locked (não altera). Para Binance exige api+secret. */
 export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
-  const { worker_name, api_key, coin, pool } = req.body || {};
+  const { worker_name, api_key, secret_key, coin, pool } = req.body || {};
 
   try {
+    // estado atual
+    const [curr] = await sql`
+      SELECT id, locked, worker_name AS w, api_key AS a, secret_key AS s, coin AS c, pool AS p
+      FROM miners
+      WHERE id = ${id}
+      LIMIT 1
+    `;
+    if (!curr) return res.status(404).json({ error: "Miner não encontrada." });
+
+    if (curr.locked === true) {
+      return res.status(423).json({ error: "Registo bloqueado pelo admin (locked=true)." });
+    }
+
+    const finalPool = pool !== undefined ? pool : curr.p;
+    const finalApi  = api_key !== undefined ? api_key : curr.a;
+    const finalSec  = secret_key !== undefined ? secret_key : curr.s;
+
+    if (finalPool === "Binance" && (!finalApi || !finalSec)) {
+      return res.status(400).json({ error: "Para Binance, api_key e secret_key são obrigatórias." });
+    }
+
     const [updatedMiner] = await sql`
       UPDATE miners
       SET
         worker_name = COALESCE(${worker_name ?? null}, worker_name),
         api_key     = COALESCE(${api_key ?? null}, api_key),
+        secret_key  = COALESCE(${secret_key ?? null}, secret_key),
         coin        = COALESCE(${coin ?? null}, coin),
-        pool        = COALESCE(${pool ?? null}, pool)
+        pool        = COALESCE(${pool ?? null}, pool),
+        updated_at  = NOW()
       WHERE id = ${id}
       RETURNING *;
     `;
@@ -106,7 +155,7 @@ export const atualizarMinerComoCliente = async (req, res) => {
 };
 
 /* ========== Atualização por admin (campos técnicos) ========== */
-/* Sem helpers avançados; valida nome se vier; normaliza decimais; COALESCE */
+/* Adiciona capacidade de alterar 'locked' (true/false) */
 export const atualizarMinerComoAdmin = async (req, res) => {
   const { id } = req.params;
   const userEmail = String(req.header("x-user-email") || "").toLowerCase();
@@ -115,7 +164,7 @@ export const atualizarMinerComoAdmin = async (req, res) => {
     return res.status(403).json({ error: "Acesso negado. Apenas admins podem editar." });
   }
 
-  let { nome, modelo, hash_rate, preco_kw, consumo_kw_hora } = req.body || {};
+  let { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, locked } = req.body || {};
 
   try {
     // nome: se enviado, não pode ser vazio (coluna NOT NULL)
@@ -133,11 +182,15 @@ export const atualizarMinerComoAdmin = async (req, res) => {
     // Decimais
     try {
       if (hash_rate !== undefined) hash_rate = normalizeDecimal(hash_rate);
-      if (preco_kw !== undefined) preco_kw = normalizeDecimal(preco_kw);
+      if (preco_kw !== undefined)  preco_kw  = normalizeDecimal(preco_kw);
       if (consumo_kw_hora !== undefined) consumo_kw_hora = normalizeDecimal(consumo_kw_hora);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
+
+    // locked (boolean)
+    const lockedParsed = parseBool(locked);
+    // undefined => não mexe; null => limpa (mas não faz sentido limpar bool) -> ignoramos
 
     const [updatedMiner] = await sql`
       UPDATE miners
@@ -146,7 +199,9 @@ export const atualizarMinerComoAdmin = async (req, res) => {
         modelo           = COALESCE(${modelo ?? null}, modelo),
         hash_rate        = COALESCE(${hash_rate ?? null}, hash_rate),
         preco_kw         = COALESCE(${preco_kw ?? null}, preco_kw),
-        consumo_kw_hora  = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora)
+        consumo_kw_hora  = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora),
+        locked           = COALESCE(${lockedParsed}, locked),
+        updated_at       = NOW()
       WHERE id = ${id}
       RETURNING *;
     `;
@@ -201,7 +256,7 @@ export const atualizarStatusMiner = async (req, res) => {
     }
     const [updatedMiner] = await sql`
       UPDATE miners
-      SET status = ${status}
+      SET status = ${status}, updated_at = NOW()
       WHERE id = ${id}
       RETURNING *;
     `;

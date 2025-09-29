@@ -1,6 +1,6 @@
 // src/controllers/minersAdmin.js
 import { sql } from "../config/db.js";
-import { resolveUserIdByEmail } from "../services/clerkUserService.js";
+import { resolveUserIdByEmail, resolveEmailByUserId } from "../services/clerkUserService.js";
 
 /* =========================
  * Helpers
@@ -188,15 +188,15 @@ export async function obterMinerPorId(req, res) {
     `;
     if (!rows.length) return res.status(404).json({ error: "Miner não encontrada." });
 
-    // Tenta enriquecer com owner_email (não explode se Clerk falhar)
     const miner = rows[0];
     let owner_email = null;
     try {
-      // Se tiveres uma função resolveEmailByUserId, usa-a aqui.
-      // Como só temos resolveUserIdByEmail (email->id), não dá para inverter sem uma API extra.
-      // Devolvemos só user_id e owner_email = null. (O UI mostra "Current owner" só se vier)
-      owner_email = null;
-    } catch { /* ignore */ }
+      if (miner?.user_id) {
+        owner_email = await resolveEmailByUserId(miner.user_id);
+      }
+    } catch {
+      owner_email = null; // não falha o endpoint
+    }
 
     res.json({ ...miner, owner_email });
   } catch (err) {
@@ -211,7 +211,7 @@ export async function patchMinerPorId(req, res) {
     const id = parseInt(String(req.params.id || ""), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
 
-    // Confirma que existe
+    // Confirma que existe e traz alguns campos atuais
     const exists = await sql/*sql*/`SELECT id, user_id, pool, api_key, secret_key FROM miners WHERE id = ${id} LIMIT 1`;
     if (!(Array.isArray(exists) ? exists.length : exists?.rows?.length)) {
       return res.status(404).json({ error: "Miner não encontrada." });
@@ -220,8 +220,8 @@ export async function patchMinerPorId(req, res) {
 
     // Helpers
     const normStr = (v) => {
-      if (v === undefined) return undefined;      // não enviado
-      if (v === null) return null;                // limpar
+      if (v === undefined) return undefined;
+      if (v === null) return null;
       const s = String(v).trim();
       return s === "" ? null : s;
     };
@@ -242,8 +242,8 @@ export async function patchMinerPorId(req, res) {
     let {
       nome, modelo, hash_rate, preco_kw, consumo_kw_hora,
       worker_name, api_key, secret_key, coin, pool,
-      locked, // pode vir do admin
-      user_email, owner_email, email, // <<< NOVO: aceitar qualquer um destes
+      locked, // opcional
+      user_email, owner_email, email, // aceitamos qualquer um destes
     } = req.body || {};
 
     // Validações mínimas e normalizações
@@ -254,13 +254,13 @@ export async function patchMinerPorId(req, res) {
     modelo          = normStr(modelo);
     worker_name     = normStr(worker_name);
     api_key         = normStr(api_key);
-    secret_key      = normStr(secret_key); // pode ser null para limpar
+    secret_key      = normStr(secret_key);
 
     // NUMERIC
     preco_kw        = normDec(preco_kw);
     consumo_kw_hora = normDec(consumo_kw_hora);
 
-    // hash_rate: TEXT no DB → trata como string
+    // hash_rate: TEXT no DB
     if (hash_rate !== undefined) {
       hash_rate = hash_rate == null ? null : String(hash_rate).trim();
       if (hash_rate === "") hash_rate = null;
@@ -270,19 +270,14 @@ export async function patchMinerPorId(req, res) {
     if (coin !== undefined && coin !== null) {
       coin = String(coin).toUpperCase().trim();
       if (!COIN_WHITELIST.includes(coin)) return res.status(400).json({ error: "Moeda inválida." });
-    } else if (coin === null) {
-      // permitir limpar
     }
-
     const POOL_WHITELIST = ["ViaBTC", "LiteCoinPool", "Binance", "F2Pool", "MiningDutch"];
     if (pool !== undefined && pool !== null) {
       pool = String(pool).trim();
       if (!POOL_WHITELIST.includes(pool)) return res.status(400).json({ error: "Pool inválida." });
-    } else if (pool === null) {
-      // permitir limpar
     }
 
-    // Verifica se as colunas 'updated_at' e 'locked' existem
+    // Verifica existência de colunas opcionais
     const [{ exists: hasUpdatedAt }] = await sql/*sql*/`
       SELECT EXISTS (
         SELECT 1 FROM information_schema.columns
@@ -296,7 +291,7 @@ export async function patchMinerPorId(req, res) {
       ) AS exists;
     `;
 
-    // Validação Binance (considera valores finais)
+    // Validação Binance com valores finais
     const willBePool = pool !== undefined ? pool : undefined;
     const willBeApi  = api_key !== undefined ? api_key : undefined;
     const willBeSec  = secret_key !== undefined ? secret_key : undefined;
@@ -329,7 +324,7 @@ export async function patchMinerPorId(req, res) {
       }
     }
 
-    // Constrói dinamicamente o SET evitando colunas inexistentes e vírgulas a mais
+    // Monta SET dinâmico
     const setParts = [];
     setParts.push(sql`nome = COALESCE(${nome ?? null}, nome)`);
     setParts.push(sql`modelo = COALESCE(${modelo ?? null}, modelo)`);
@@ -364,8 +359,16 @@ export async function patchMinerPorId(req, res) {
 
     if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
 
-    // Opcional: devolve owner_email se tens maneira server-side de o obter. Mantemos null.
-    return res.json({ ok: true, miner: { ...updated, owner_email: null } });
+    // Resolve o e-mail do dono atual (novo ou antigo)
+    let finalOwnerEmail = null;
+    try {
+      const uid = newUserId !== undefined ? newUserId : (updated.user_id ?? currentRow.user_id ?? null);
+      if (uid) finalOwnerEmail = await resolveEmailByUserId(uid);
+    } catch {
+      finalOwnerEmail = null;
+    }
+
+    return res.json({ ok: true, miner: { ...updated, owner_email: finalOwnerEmail } });
   } catch (err) {
     console.error("patchMinerPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao atualizar miner." });

@@ -122,7 +122,7 @@ async function closeMonthOnce(year, month) {
 
 export function startMonthlyClose() {
   cron.schedule(
-    "25 18 1 * *", // dia 1 às 17:45
+    "05 00 1 * *", // dia 1 às 17:45
     async () => {
       try {
         const { year, month } = previousMonthLisbon();

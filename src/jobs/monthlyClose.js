@@ -4,18 +4,15 @@ import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
 const TZ = "Europe/Lisbon";
+const MIN_INVOICE_USD = 15; // valor mínimo para fechar fatura
 
-/* ==== helpers ==== */
 function previousMonthLisbon(baseDate = new Date()) {
   const y = baseDate.getFullYear();
-  const m = baseDate.getMonth() + 1; // 1..12
-  if (m === 1) {
-    return { year: y - 1, month: 12 };
-  }
+  const m = baseDate.getMonth() + 1;
+  if (m === 1) return { year: y - 1, month: 12 };
   return { year: y, month: m - 1 };
 }
 
-/* ===== invoice upsert ===== */
 async function getOrCreateInvoiceId(userId, year, month) {
   const existing = await sql/*sql*/`
     SELECT id FROM energy_invoices
@@ -32,10 +29,10 @@ async function getOrCreateInvoiceId(userId, year, month) {
   return inserted[0]?.id;
 }
 
-/* ===== core ===== */
 async function closeMonthOnce(year, month) {
-  const lockKey = `monthly-close:${year}-${String(month).padStart(2, "0")}`;
-  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 60 * 60 * 12 });
+  const today = new Date();
+  const lockKey = `monthly-close:${year}-${String(month).padStart(2, "0")}-${today.getDate()}`;
+  const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 60 * 60 });
   if (!gotLock) {
     console.log(`[monthlyClose] lock ativo ${year}-${month}, a ignorar duplicado.`);
     return;
@@ -59,21 +56,35 @@ async function closeMonthOnce(year, month) {
   }
 
   for (const [userId, list] of byUser.entries()) {
-    const invoiceId = await getOrCreateInvoiceId(userId, year, month);
-    if (!invoiceId) {
-      console.warn(`[monthlyClose] falha ao obter/crear invoice para user=${userId} ${month}/${year}`);
-      continue;
-    }
     let subtotal = 0;
 
     for (const m of list) {
       const hours = Number(m.hours) || 0;
       const consumo = Number(m.consumo_kw_hora) || 0;
       const preco = Number(m.preco_kw) || 0;
-
       const kwh = +(hours * consumo).toFixed(3);
       const amount = +(kwh * preco).toFixed(2);
       subtotal += amount;
+    }
+
+    if (subtotal < MIN_INVOICE_USD) {
+      console.log(`[monthlyClose] user=${userId} subtotal=${subtotal} < ${MIN_INVOICE_USD}, não gera fatura.`);
+      continue; // não cria invoice nem reseta horas
+    }
+
+    const invoiceId = await getOrCreateInvoiceId(userId, year, month);
+    if (!invoiceId) {
+      console.warn(`[monthlyClose] falha ao criar/obter invoice para user=${userId} ${month}/${year}`);
+      continue;
+    }
+
+    // recriar itens
+    for (const m of list) {
+      const hours = Number(m.hours) || 0;
+      const consumo = Number(m.consumo_kw_hora) || 0;
+      const preco = Number(m.preco_kw) || 0;
+      const kwh = +(hours * consumo).toFixed(3);
+      const amount = +(kwh * preco).toFixed(2);
 
       await sql/*sql*/`
         INSERT INTO energy_invoice_items
@@ -97,18 +108,21 @@ async function closeMonthOnce(year, month) {
           updated_at = NOW()
       WHERE id = ${invoiceId}
     `;
+
+    // reset horas SÓ deste utilizador
+    await sql/*sql*/`
+      UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}
+    `;
+
+    console.log(`✅ Fecho mensal user=${userId} total=${subtotal} USD`);
   }
 
-  await sql/*sql*/`UPDATE miners SET total_horas_online = 0;`;
-
-  console.log(`✅ Fecho mensal concluído às 17:45 Europe/Lisbon: ${month}/${year}`);
+  console.log(`✅ Fecho mensal concluído para ${month}/${year}`);
 }
 
-/* ===== scheduler ===== */
 export function startMonthlyClose() {
-  // Dia 1 de cada mês às 17:45 (hora Lisboa), fecha o mês anterior
   cron.schedule(
-    "12 18 1 * *",
+    "25 18 1 * *", // dia 1 às 17:45
     async () => {
       try {
         const { year, month } = previousMonthLisbon();
@@ -121,7 +135,6 @@ export function startMonthlyClose() {
   );
 }
 
-/* ===== util manual ===== */
 export async function runMonthlyCloseNow() {
   const { year, month } = previousMonthLisbon();
   await closeMonthOnce(year, month);

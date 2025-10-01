@@ -39,7 +39,7 @@ export function startMonthlyClose() {
   // Corre TODOS os dias às 17:33, hora de Lisboa.
   // Só executa o fecho se for o ÚLTIMO dia do mês.
   cron.schedule(
-    "33 17 * * *",
+    "45 17 * * *",
     async () => {
       if (!isLastDayOfMonth()) {
         return; // não é último dia — sai calado

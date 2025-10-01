@@ -25,8 +25,8 @@ async function getOrCreateInvoiceId(userId, year, month) {
   if (existing[0]?.id) return existing[0].id;
 
   const inserted = await sql/*sql*/`
-    INSERT INTO energy_invoices (user_id, year, month, subtotal_eur, status)
-    VALUES (${userId}, ${year}, ${month}, 0, 'pendente')
+    INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
+    VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
     RETURNING id
   `;
   return inserted[0]?.id;
@@ -92,7 +92,9 @@ async function closeMonthOnce(year, month) {
 
     await sql/*sql*/`
       UPDATE energy_invoices
-      SET subtotal_eur = ${+subtotal.toFixed(2)}, status = 'pendente'
+      SET subtotal_amount = ${+subtotal.toFixed(2)}::numeric,
+          status = 'pendente',
+          updated_at = NOW()
       WHERE id = ${invoiceId}
     `;
   }
@@ -106,7 +108,7 @@ async function closeMonthOnce(year, month) {
 export function startMonthlyClose() {
   // Dia 1 de cada mês às 17:45 (hora Lisboa), fecha o mês anterior
   cron.schedule(
-    "00 18 1 * *",
+    "12 18 1 * *",
     async () => {
       try {
         const { year, month } = previousMonthLisbon();
